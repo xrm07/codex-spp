@@ -1,0 +1,18 @@
+# codex-spp template configuration
+# Copy this file to .codex-spp/config.toml and customize as needed.
+
+log_schema_version = "1.0"
+weekly_ratio_target = 0.70
+max_log_bytes = 524288000
+diff_snapshot_enabled = false
+
+[codex.normal]
+sandbox = "workspace-write"
+approval = "on-request"
+
+[codex.drive]
+sandbox = "read-only"
+approval = "on-request"
+
+[attribution]
+codex_author_emails = ["codex-bot@example.com"]

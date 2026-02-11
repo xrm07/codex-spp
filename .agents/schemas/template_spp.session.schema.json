@@ -1,0 +1,58 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://codex-spp.local/schemas/template_spp.session.schema.json",
+  "title": "codex-spp session log entry template",
+  "type": "object",
+  "required": [
+    "log_schema_version",
+    "timestamp",
+    "command",
+    "mode",
+    "sandbox",
+    "approval",
+    "git_branch"
+  ],
+  "properties": {
+    "log_schema_version": {
+      "type": "string"
+    },
+    "timestamp": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "command": {
+      "type": "string"
+    },
+    "mode": {
+      "type": "string",
+      "enum": ["normal", "drive"]
+    },
+    "sandbox": {
+      "type": "string",
+      "enum": ["workspace-write", "read-only"]
+    },
+    "approval": {
+      "type": "string"
+    },
+    "git_branch": {
+      "type": "string"
+    },
+    "git_commit": {
+      "type": ["string", "null"]
+    },
+    "gate_ratio": {
+      "type": ["number", "null"],
+      "minimum": 0.0,
+      "maximum": 1.0
+    },
+    "gate_target": {
+      "type": ["number", "null"],
+      "minimum": 0.0,
+      "maximum": 1.0
+    },
+    "notes": {
+      "type": ["string", "null"]
+    }
+  },
+  "additionalProperties": false
+}
