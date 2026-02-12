@@ -34,6 +34,7 @@ const DEFAULT_HISTORY_PATH: &str = "auto";
 const DEFAULT_CHAT_SOURCE: &str = "history_jsonl";
 const DEFAULT_TRANSCRIPT_EVENT_MAX_BYTES: u64 = 64_000;
 const DEFAULT_POLL_INTERVAL_MS: u64 = 2000;
+const MAX_RECORDER_ERRORS: usize = 50;
 
 static EVENT_COUNTER: AtomicU64 = AtomicU64::new(1);
 
@@ -788,7 +789,8 @@ fn cmd_drive_stop(repo_root: &Path) -> Result<()> {
     fs::write(&control_path, "stop\n")
         .with_context(|| format!("failed to write {}", control_path.display()))?;
 
-    let done = wait_for_recorder_done(&done_path, StdDuration::from_secs(15))?;
+    let wait_timeout = stop_wait_timeout(&config);
+    let done = wait_for_recorder_done(&done_path, wait_timeout)?;
     let timeout = done.is_none();
     let mut timeout_errors = Vec::new();
     if timeout {
@@ -1032,6 +1034,13 @@ fn wait_for_recorder_done(path: &Path, timeout: StdDuration) -> Result<Option<Re
     Ok(None)
 }
 
+fn stop_wait_timeout(config: &AppConfig) -> StdDuration {
+    let poll_ms = config.transcript.poll_interval_ms.max(100);
+    let dynamic_ms = poll_ms.saturating_mul(3);
+    let wait_ms = dynamic_ms.max(15_000);
+    StdDuration::from_millis(wait_ms)
+}
+
 fn terminate_recorder_process(pid: u32) -> Result<()> {
     #[cfg(unix)]
     {
@@ -1083,6 +1092,7 @@ fn run_drive_recorder_loop(repo_root: &Path, args: &DriveRecordArgs) -> Result<R
     let mut chat_events = 0_u64;
     let mut diff_events = 0_u64;
     let mut errors = Vec::new();
+    let mut error_seen = HashSet::new();
     let poll_interval = StdDuration::from_millis(args.poll_interval_ms.max(100));
 
     loop {
@@ -1124,14 +1134,22 @@ fn run_drive_recorder_loop(repo_root: &Path, args: &DriveRecordArgs) -> Result<R
                             notes: None,
                         };
                         if let Err(err) = write_transcript_event(&args.transcript_path, &event) {
-                            errors.push(format!("failed to write chat event: {err:#}"));
+                            push_recorder_error(
+                                &mut errors,
+                                &mut error_seen,
+                                format!("failed to write chat event: {err:#}"),
+                            );
                         } else {
                             chat_events += 1;
                         }
                     }
                 }
             }
-            Err(err) => errors.push(format!("failed to read history stream: {err:#}")),
+            Err(err) => push_recorder_error(
+                &mut errors,
+                &mut error_seen,
+                format!("failed to read history stream: {err:#}"),
+            ),
         }
 
         if args.include_file_diff {
@@ -1167,7 +1185,11 @@ fn run_drive_recorder_loop(repo_root: &Path, args: &DriveRecordArgs) -> Result<R
                             };
                             if let Err(err) = write_transcript_event(&args.transcript_path, &event)
                             {
-                                errors.push(format!("failed to write diff event: {err:#}"));
+                                push_recorder_error(
+                                    &mut errors,
+                                    &mut error_seen,
+                                    format!("failed to write diff event: {err:#}"),
+                                );
                             } else {
                                 diff_events += 1;
                             }
@@ -1175,7 +1197,11 @@ fn run_drive_recorder_loop(repo_root: &Path, args: &DriveRecordArgs) -> Result<R
                     }
                     snapshot = next_snapshot;
                 }
-                Err(err) => errors.push(format!("failed to capture workspace snapshot: {err:#}")),
+                Err(err) => push_recorder_error(
+                    &mut errors,
+                    &mut error_seen,
+                    format!("failed to capture workspace snapshot: {err:#}"),
+                ),
             }
         }
 
@@ -1194,6 +1220,26 @@ fn run_drive_recorder_loop(repo_root: &Path, args: &DriveRecordArgs) -> Result<R
         diff_events,
         errors,
     })
+}
+
+fn push_recorder_error(errors: &mut Vec<String>, seen: &mut HashSet<String>, message: String) {
+    let truncated_marker = "__truncated__";
+    if errors.len() >= MAX_RECORDER_ERRORS + 1 {
+        return;
+    }
+
+    if !seen.insert(message.clone()) {
+        return;
+    }
+
+    errors.push(message);
+    if errors.len() == MAX_RECORDER_ERRORS && !seen.contains(truncated_marker) {
+        let _ = seen.insert(truncated_marker.to_string());
+        errors.push(format!(
+            "recorder errors truncated at {} unique entries",
+            MAX_RECORDER_ERRORS
+        ));
+    }
 }
 
 fn should_stop_recorder(control_path: &Path) -> bool {
