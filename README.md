@@ -45,14 +45,15 @@ It keeps development human-led by combining policy files, Codex skills, and a wr
 # 1) Build wrapper CLI
 cargo build -p spp
 
-# 2) Prepare runtime config
+# 2) Initialize runtime directories/state
+cargo run -p spp -- init
+
+# 3) (Optional) overwrite runtime config from template
 cp template_spp.config.toml .codex-spp/config.toml
 
-# 3) Optional: project codex config template
+# 4) Optional: project codex config template
+mkdir -p .codex
 cp template_spp.codex.config.toml .codex/config.toml
-
-# 4) Initialize runtime directories/state
-cargo run -p spp -- init
 
 # 5) Check current weekly gate status
 cargo run -p spp -- status
@@ -70,7 +71,7 @@ spp drive              # alias of `spp drive start`
 spp drive start
 spp drive stop
 spp drive status
-spp pause --hours <1..24>
+spp pause --hours <N>    # value is clamped to 1..24
 spp resume
 spp reset
 spp codex [--dry-run] [EXTRA...]
@@ -92,10 +93,13 @@ spp attrib fix --actor <human|ai> <commit>
   Shows mode and active Drive session metadata.
 - `pause`
   Temporarily bypasses gate enforcement for up to 24 hours.
+  `--hours` is clamped to `1..24` (e.g. `0 -> 1`, `99 -> 24`).
 - `resume`
   Clears active pause and resumes gate checks.
 - `reset`
-  Resets state and clears weekly report files.
+  Resets state (including manual attribution overrides) and clears files in
+  `.codex-spp/weekly/`, `.codex-spp/transcripts/`, and `.codex-spp/runtime/`.
+  Session logs in `.codex-spp/sessions/` are not removed.
 - `codex`
   Applies gate logic, logs session metadata, and launches Codex with enforced flags.
 - `project init`
@@ -163,6 +167,7 @@ Main settings:
 - `[attribution].codex_author_emails`
 
 Tip: for large repositories, increase `[transcript].poll_interval_ms` to reduce recorder I/O load.
+Note: `diff_snapshot_enabled` is currently reserved and does not change runtime behavior yet.
 
 ## Logs and Data Layout
 
