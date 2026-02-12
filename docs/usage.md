@@ -3,7 +3,9 @@
 ## Core Commands
 
 - `spp init`: create runtime directories and default state.
-- `spp status`: evaluate weekly ratio and print gate status.
+- `spp status`: evaluate weekly ratio and print two-block rich gate summary
+  (`mode/gate/week`, `gate reason`, lines+commits ratios, human/AI breakdown, pause, notes).
+- `spp status --plain`: print legacy minimal status output.
 - `spp drive start`: start Drive session and begin transcript recording.
 - `spp drive stop`: stop active Drive session and finalize transcript.
 - `spp drive status`: show Drive mode/session state.

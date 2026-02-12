@@ -108,7 +108,7 @@ struct Cli {
 #[derive(Subcommand, Debug)]
 enum Commands {
     Init,
-    Status,
+    Status(StatusArgs),
     Drive(DriveArgs),
     Pause(PauseArgs),
     Resume,
@@ -122,6 +122,12 @@ enum Commands {
         #[command(subcommand)]
         command: AttribCommands,
     },
+}
+
+#[derive(Args, Debug)]
+struct StatusArgs {
+    #[arg(long, default_value_t = false)]
+    plain: bool,
 }
 
 #[derive(Args, Debug)]
@@ -493,7 +499,7 @@ fn main() -> Result<()> {
             let repo_root = detect_repo_root()?;
             match other {
                 Commands::Init => cmd_init(&repo_root),
-                Commands::Status => cmd_status(&repo_root),
+                Commands::Status(args) => cmd_status(&repo_root, args),
                 Commands::Drive(args) => cmd_drive(&repo_root, args),
                 Commands::Pause(args) => cmd_pause(&repo_root, args),
                 Commands::Resume => cmd_resume(&repo_root),
@@ -615,7 +621,7 @@ fn cmd_init(repo_root: &Path) -> Result<()> {
     Ok(())
 }
 
-fn cmd_status(repo_root: &Path) -> Result<()> {
+fn cmd_status(repo_root: &Path, args: StatusArgs) -> Result<()> {
     ensure_runtime_dirs(repo_root)?;
     let config = load_config(repo_root)?;
     let mut state = load_state(repo_root)?;
@@ -629,16 +635,116 @@ fn cmd_status(repo_root: &Path) -> Result<()> {
     write_weekly_report(repo_root, &report)?;
     enforce_log_size(repo_root, config.max_log_bytes)?;
 
-    println!("mode: {:?}", state.mode);
-    println!(
-        "ratio: {:.3} (target: {:.3}) gate_passed: {}",
-        report.ratio, report.target_ratio, report.gate_passed
-    );
-    if let Some(pause_until) = state.pause_until {
-        println!("pause_until: {}", pause_until.to_rfc3339());
+    if args.plain {
+        print!("{}", render_status_plain(&state, &report));
+    } else {
+        print!("{}", render_status_rich(&state, &report, pause));
     }
 
     Ok(())
+}
+
+fn render_status_plain(state: &State, report: &WeeklyReport) -> String {
+    let mut lines = vec![
+        format!("mode: {:?}", state.mode),
+        format!(
+            "ratio: {:.3} (target: {:.3}) gate_passed: {}",
+            report.ratio, report.target_ratio, report.gate_passed
+        ),
+    ];
+    if let Some(pause_until) = state.pause_until {
+        lines.push(format!("pause_until: {}", pause_until.to_rfc3339()));
+    }
+    lines.join("\n") + "\n"
+}
+
+fn render_status_rich(state: &State, report: &WeeklyReport, pause_active: bool) -> String {
+    use std::fmt::Write as _;
+
+    let gate = if report.gate_passed { "PASS" } else { "FAIL" };
+    let mode = match state.mode {
+        Mode::Normal => "Normal",
+        Mode::Drive => "Drive",
+    };
+    let reason = status_gate_reason(state, report, pause_active);
+    let lines_delta = report.ratio - report.target_ratio;
+    let commits_ratio = commit_ratio(report);
+    let pause_text = state
+        .pause_until
+        .map(|pause_until| pause_until.to_rfc3339())
+        .unwrap_or_else(|| "none".to_string());
+
+    let mut out = String::new();
+    let _ = writeln!(
+        &mut out,
+        "Mode: {mode} | Gate: {gate} | Week: {}-W{:02}",
+        report.year, report.iso_week
+    );
+    let _ = writeln!(&mut out, "Gate reason: {reason}");
+    let _ = writeln!(
+        &mut out,
+        "Lines: {} | Target: {} | Delta: {}",
+        percent_1dp(report.ratio),
+        percent_1dp(report.target_ratio),
+        points_delta(lines_delta)
+    );
+    let _ = writeln!(&mut out, "Commits: {}", percent_1dp(commits_ratio));
+    let _ = writeln!(&mut out);
+    let _ = writeln!(
+        &mut out,
+        "Human: {} commits / {} lines",
+        report.human_commit_count, report.human_lines_added
+    );
+    let _ = writeln!(
+        &mut out,
+        "AI: {} commits / {} lines",
+        report.ai_commit_count, report.ai_lines_added
+    );
+    let _ = writeln!(&mut out, "Pause until: {pause_text}");
+    if report.notes.is_empty() {
+        let _ = writeln!(&mut out, "Notes: none");
+    } else {
+        let _ = writeln!(&mut out, "Notes:");
+        for note in &report.notes {
+            let _ = writeln!(&mut out, "  - {note}");
+        }
+    }
+
+    out
+}
+
+fn status_gate_reason(state: &State, report: &WeeklyReport, pause_active: bool) -> &'static str {
+    if report.gate_passed {
+        return "on target";
+    }
+    if pause_active {
+        return "below target, gate paused";
+    }
+    if state.mode == Mode::Drive && state.drive_reason.as_deref() == Some("gate") {
+        return "below target, drive enforced";
+    }
+    "below target"
+}
+
+fn safe_ratio(numerator: u64, denominator: u64) -> f64 {
+    if denominator == 0 {
+        1.0
+    } else {
+        numerator as f64 / denominator as f64
+    }
+}
+
+fn commit_ratio(report: &WeeklyReport) -> f64 {
+    let total = report.human_commit_count + report.ai_commit_count;
+    safe_ratio(report.human_commit_count, total)
+}
+
+fn percent_1dp(ratio: f64) -> String {
+    format!("{:.1}%", ratio * 100.0)
+}
+
+fn points_delta(delta: f64) -> String {
+    format!("{:+.1}pt", delta * 100.0)
 }
 
 fn cmd_drive(repo_root: &Path, args: DriveArgs) -> Result<()> {
@@ -2232,6 +2338,115 @@ mod tests {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.path);
         }
+    }
+
+    fn sample_weekly_report() -> WeeklyReport {
+        WeeklyReport {
+            log_schema_version: "1.1".to_string(),
+            generated_at: Utc::now(),
+            year: 2026,
+            iso_week: 7,
+            human_lines_added: 60,
+            ai_lines_added: 40,
+            human_commit_count: 3,
+            ai_commit_count: 1,
+            ratio: 0.6,
+            target_ratio: 0.7,
+            gate_passed: false,
+            mode_after_evaluation: Mode::Normal,
+            notes: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn safe_ratio_returns_one_when_denominator_zero() {
+        assert_eq!(safe_ratio(0, 0), 1.0);
+        assert_eq!(safe_ratio(3, 0), 1.0);
+    }
+
+    #[test]
+    fn commit_ratio_uses_human_commits() {
+        let report = sample_weekly_report();
+        assert!((commit_ratio(&report) - 0.75).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn commit_ratio_returns_one_when_total_commit_is_zero() {
+        let mut report = sample_weekly_report();
+        report.human_commit_count = 0;
+        report.ai_commit_count = 0;
+        assert_eq!(commit_ratio(&report), 1.0);
+    }
+
+    #[test]
+    fn render_status_plain_matches_legacy_output_shape() {
+        let state = State::default();
+        let report = sample_weekly_report();
+        let rendered = render_status_plain(&state, &report);
+        assert_eq!(
+            rendered,
+            "mode: Normal\nratio: 0.600 (target: 0.700) gate_passed: false\n"
+        );
+    }
+
+    #[test]
+    fn render_status_rich_always_shows_pause_and_notes() {
+        let state = State::default();
+        let report = sample_weekly_report();
+        let rendered = render_status_rich(&state, &report, false);
+
+        assert!(rendered.contains("Mode: Normal | Gate: FAIL | Week: 2026-W07"));
+        assert!(rendered.contains("Gate reason: below target"));
+        assert!(rendered.contains("Lines: 60.0% | Target: 70.0% | Delta: -10.0pt"));
+        assert!(rendered.contains("Commits: 75.0%"));
+        assert!(rendered.contains("Commits: 75.0%\n\nHuman: 3 commits / 60 lines"));
+        assert!(rendered.contains("Human: 3 commits / 60 lines"));
+        assert!(rendered.contains("AI: 1 commits / 40 lines"));
+        assert!(rendered.contains("Pause until: none"));
+        assert!(rendered.contains("Notes: none"));
+    }
+
+    #[test]
+    fn render_status_rich_shows_pause_and_each_note() {
+        let mut state = State::default();
+        state.pause_until = Some(Utc::now() + Duration::hours(1));
+
+        let mut report = sample_weekly_report();
+        report.notes = vec![
+            "gate evaluation bypassed due to active pause".to_string(),
+            "sample note".to_string(),
+        ];
+
+        let rendered = render_status_rich(&state, &report, true);
+        assert!(rendered.contains("Gate reason: below target, gate paused"));
+        assert!(rendered.contains("Pause until: "));
+        assert!(rendered.contains("Notes:\n  - gate evaluation bypassed due to active pause"));
+        assert!(rendered.contains("  - sample note"));
+    }
+
+    #[test]
+    fn status_gate_reason_covers_all_branches() {
+        let state = State::default();
+        let mut report = sample_weekly_report();
+
+        report.gate_passed = true;
+        assert_eq!(status_gate_reason(&state, &report, false), "on target");
+
+        report.gate_passed = false;
+        assert_eq!(
+            status_gate_reason(&state, &report, true),
+            "below target, gate paused"
+        );
+
+        let mut drive_state = State::default();
+        drive_state.mode = Mode::Drive;
+        drive_state.drive_reason = Some("gate".to_string());
+        assert_eq!(
+            status_gate_reason(&drive_state, &report, false),
+            "below target, drive enforced"
+        );
+
+        assert_eq!(status_gate_reason(&state, &report, false), "below target");
     }
 
     #[test]
