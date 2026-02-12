@@ -35,6 +35,7 @@ const DEFAULT_CHAT_SOURCE: &str = "history_jsonl";
 const DEFAULT_TRANSCRIPT_EVENT_MAX_BYTES: u64 = 64_000;
 const DEFAULT_POLL_INTERVAL_MS: u64 = 2000;
 const MAX_RECORDER_ERRORS: usize = 50;
+const FILE_STATE_REVALIDATE_INTERVAL_POLLS: u64 = 30;
 
 static EVENT_COUNTER: AtomicU64 = AtomicU64::new(1);
 
@@ -749,7 +750,24 @@ fn cmd_drive_start(repo_root: &Path) -> Result<()> {
         &done_path,
         &config.transcript,
     );
-    let recorder_pid = spawn_recorder(repo_root, &recorder_args)?;
+    let recorder_pid = match spawn_recorder(repo_root, &recorder_args) {
+        Ok(pid) => pid,
+        Err(err) => {
+            let spawn_error_message = format!("{err:#}");
+            let _ = append_start_failed_session_end(
+                &transcript_path,
+                &config.log_schema_version,
+                &session_id,
+                state.mode.clone(),
+                &spawn_error_message,
+            );
+            let _ = fs::remove_file(&control_path);
+            if done_path.exists() {
+                let _ = fs::remove_file(&done_path);
+            }
+            return Err(err);
+        }
+    };
 
     state.active_drive_session = Some(ActiveDriveSession {
         session_id: session_id.clone(),
@@ -1085,7 +1103,7 @@ fn write_recorder_done(path: &Path, done: &RecorderDone) -> Result<()> {
 fn run_drive_recorder_loop(repo_root: &Path, args: &DriveRecordArgs) -> Result<RecorderDone> {
     let mut history_offset = args.history_offset;
     let mut snapshot = if args.include_file_diff {
-        capture_workspace_text_files(repo_root, &args.exclude, None)?
+        capture_workspace_text_files(repo_root, &args.exclude, None, false)?
     } else {
         HashMap::new()
     };
@@ -1093,10 +1111,13 @@ fn run_drive_recorder_loop(repo_root: &Path, args: &DriveRecordArgs) -> Result<R
     let mut diff_events = 0_u64;
     let mut errors = Vec::new();
     let mut error_seen = HashSet::new();
+    let mut poll_count = 0_u64;
     let poll_interval = StdDuration::from_millis(args.poll_interval_ms.max(100));
 
     loop {
-        let stop_requested = should_stop_recorder(&args.control_path);
+        if should_stop_recorder(&args.control_path) {
+            break;
+        }
 
         match read_history_values(&args.history_path, history_offset) {
             Ok((next_offset, values)) => {
@@ -1152,8 +1173,19 @@ fn run_drive_recorder_loop(repo_root: &Path, args: &DriveRecordArgs) -> Result<R
             ),
         }
 
+        if should_stop_recorder(&args.control_path) {
+            break;
+        }
+
         if args.include_file_diff {
-            match capture_workspace_text_files(repo_root, &args.exclude, Some(&snapshot)) {
+            poll_count = poll_count.saturating_add(1);
+            let force_content_refresh = should_force_refresh_file_state(poll_count);
+            match capture_workspace_text_files(
+                repo_root,
+                &args.exclude,
+                Some(&snapshot),
+                force_content_refresh,
+            ) {
                 Ok(next_snapshot) => {
                     let mut paths: HashSet<String> = HashSet::new();
                     paths.extend(snapshot.keys().cloned());
@@ -1203,10 +1235,6 @@ fn run_drive_recorder_loop(repo_root: &Path, args: &DriveRecordArgs) -> Result<R
                     format!("failed to capture workspace snapshot: {err:#}"),
                 ),
             }
-        }
-
-        if stop_requested {
-            break;
         }
 
         sleep(poll_interval);
@@ -1296,6 +1324,10 @@ fn read_history_values(path: &Path, offset: u64) -> Result<(u64, Vec<Value>)> {
     }
 
     Ok((current_offset, values))
+}
+
+fn should_force_refresh_file_state(poll_count: u64) -> bool {
+    poll_count > 0 && poll_count % FILE_STATE_REVALIDATE_INTERVAL_POLLS == 0
 }
 
 fn extract_chat_messages(value: &Value, max_event_bytes: u64) -> Vec<ChatMessage> {
@@ -1429,21 +1461,22 @@ fn capture_workspace_text_files(
     repo_root: &Path,
     exclude: &[String],
     previous: Option<&HashMap<String, FileState>>,
+    force_content_refresh: bool,
 ) -> Result<HashMap<String, FileState>> {
     let mut snapshot = HashMap::new();
     for entry in WalkDir::new(repo_root)
         .follow_links(false)
         .into_iter()
+        .filter_entry(|entry| should_walk_entry(repo_root, entry.path(), exclude))
         .filter_map(|entry| entry.ok())
     {
         if !entry.file_type().is_file() {
             continue;
         }
-        let rel = match entry.path().strip_prefix(repo_root) {
-            Ok(rel) => rel,
-            Err(_) => continue,
+        let rel_path = match relative_path_string(repo_root, entry.path()) {
+            Some(rel_path) if !rel_path.is_empty() => rel_path,
+            _ => continue,
         };
-        let rel_path = rel.to_string_lossy().replace('\\', "/");
         if is_excluded_path(&rel_path, exclude) {
             continue;
         }
@@ -1458,7 +1491,7 @@ fn capture_workspace_text_files(
         let modified = metadata.modified().ok();
 
         if let Some(prev) = previous.and_then(|prev| prev.get(&rel_path)) {
-            if prev.len == len && prev.modified == modified {
+            if should_reuse_previous_file_state(prev, len, modified, force_content_refresh) {
                 snapshot.insert(rel_path, prev.clone());
                 continue;
             }
@@ -1488,6 +1521,30 @@ fn capture_workspace_text_files(
         );
     }
     Ok(snapshot)
+}
+
+fn relative_path_string(repo_root: &Path, path: &Path) -> Option<String> {
+    let rel = path.strip_prefix(repo_root).ok()?;
+    Some(rel.to_string_lossy().replace('\\', "/"))
+}
+
+fn should_walk_entry(repo_root: &Path, entry_path: &Path, excludes: &[String]) -> bool {
+    let Some(rel_path) = relative_path_string(repo_root, entry_path) else {
+        return true;
+    };
+    if rel_path.is_empty() {
+        return true;
+    }
+    !is_excluded_path(&rel_path, excludes)
+}
+
+fn should_reuse_previous_file_state(
+    previous: &FileState,
+    len: u64,
+    modified: Option<SystemTime>,
+    force_content_refresh: bool,
+) -> bool {
+    !force_content_refresh && previous.len == len && previous.modified == modified
 }
 
 fn is_excluded_path(path: &str, excludes: &[String]) -> bool {
@@ -2109,4 +2166,183 @@ fn touch(path: &Path) -> Result<()> {
     }
     let _ = File::options().create(true).append(true).open(path)?;
     Ok(())
+}
+
+fn append_start_failed_session_end(
+    transcript_path: &Path,
+    log_schema_version: &str,
+    session_id: &str,
+    mode: Mode,
+    error_message: &str,
+) -> Result<()> {
+    let end_event = TranscriptEvent {
+        log_schema_version: log_schema_version.to_string(),
+        event_id: generate_event_id(),
+        session_id: session_id.to_string(),
+        event_type: "session_end".to_string(),
+        timestamp: Utc::now(),
+        mode,
+        payload: Some(json!({
+            "stats": {
+                "chat_events": 0,
+                "diff_events": 0,
+                "duration_sec": 0,
+                "history_offset": 0
+            },
+            "reason": "start_failed",
+            "errors": [error_message]
+        })),
+        notes: None,
+    };
+    write_transcript_event(transcript_path, &end_event)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static TEMP_DIR_COUNTER: AtomicU64 = AtomicU64::new(1);
+
+    struct TempDirGuard {
+        path: PathBuf,
+    }
+
+    impl TempDirGuard {
+        fn new(prefix: &str) -> Result<Self> {
+            let id = TEMP_DIR_COUNTER.fetch_add(1, Ordering::Relaxed);
+            let path = std::env::temp_dir().join(format!("{prefix}-{}-{id}", std::process::id()));
+            fs::create_dir_all(&path)?;
+            Ok(Self { path })
+        }
+
+        fn path(&self) -> &Path {
+            &self.path
+        }
+    }
+
+    impl Drop for TempDirGuard {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.path);
+        }
+    }
+
+    #[test]
+    fn should_walk_entry_skips_excluded_dirs_and_keeps_similar_prefixes() {
+        let repo_root = PathBuf::from("/tmp/repo");
+        let excludes = vec![".codex-spp/".to_string(), ".git/".to_string()];
+
+        assert!(!should_walk_entry(
+            &repo_root,
+            &repo_root.join(".codex-spp"),
+            &excludes
+        ));
+        assert!(!should_walk_entry(
+            &repo_root,
+            &repo_root.join(".codex-spp/runtime"),
+            &excludes
+        ));
+        assert!(should_walk_entry(
+            &repo_root,
+            &repo_root.join(".codex-spp-backup"),
+            &excludes
+        ));
+    }
+
+    #[test]
+    fn recorder_loop_stops_before_history_read_when_stop_requested() -> Result<()> {
+        let temp = TempDirGuard::new("spp-recorder-stop")?;
+        let control_path = temp.path().join("control");
+        fs::write(&control_path, "stop\n")?;
+
+        let args = DriveRecordArgs {
+            session_id: "session".to_string(),
+            log_schema_version: "1.1".to_string(),
+            transcript_path: temp.path().join("transcript.jsonl"),
+            history_path: temp.path().join("missing-history.jsonl"),
+            history_offset: 0,
+            control_path,
+            done_path: temp.path().join("done.json"),
+            include_file_diff: true,
+            capture_full_text: true,
+            max_event_bytes: DEFAULT_TRANSCRIPT_EVENT_MAX_BYTES,
+            poll_interval_ms: 100,
+            exclude: Vec::new(),
+        };
+
+        let done = run_drive_recorder_loop(temp.path(), &args)?;
+        assert_eq!(done.chat_events, 0);
+        assert_eq!(done.diff_events, 0);
+        assert!(done.errors.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn should_reuse_previous_file_state_respects_force_refresh() {
+        let previous = FileState {
+            len: 10,
+            modified: Some(SystemTime::UNIX_EPOCH),
+            content: Arc::<str>::from("previous"),
+        };
+
+        assert!(should_reuse_previous_file_state(
+            &previous,
+            10,
+            Some(SystemTime::UNIX_EPOCH),
+            false
+        ));
+        assert!(!should_reuse_previous_file_state(
+            &previous,
+            10,
+            Some(SystemTime::UNIX_EPOCH),
+            true
+        ));
+    }
+
+    #[test]
+    fn append_start_failed_session_end_writes_recovery_event() -> Result<()> {
+        let temp = TempDirGuard::new("spp-start-failed")?;
+        let transcript_path = temp.path().join("transcript.jsonl");
+        let start_event = TranscriptEvent {
+            log_schema_version: "1.1".to_string(),
+            event_id: "e1".to_string(),
+            session_id: "session-a".to_string(),
+            event_type: "session_start".to_string(),
+            timestamp: Utc::now(),
+            mode: Mode::Drive,
+            payload: None,
+            notes: None,
+        };
+        write_transcript_event(&transcript_path, &start_event)?;
+
+        append_start_failed_session_end(
+            &transcript_path,
+            "1.1",
+            "session-a",
+            Mode::Drive,
+            "spawn failed",
+        )?;
+
+        let raw = fs::read_to_string(&transcript_path)?;
+        let events = raw
+            .lines()
+            .map(serde_json::from_str::<Value>)
+            .collect::<Result<Vec<_>, _>>()?;
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[1]["event_type"], "session_end");
+        assert_eq!(events[1]["payload"]["reason"], "start_failed");
+        assert_eq!(events[1]["payload"]["errors"][0], "spawn failed");
+        Ok(())
+    }
+
+    #[test]
+    fn should_force_refresh_file_state_uses_fixed_interval() {
+        assert!(!should_force_refresh_file_state(1));
+        assert!(!should_force_refresh_file_state(
+            FILE_STATE_REVALIDATE_INTERVAL_POLLS - 1
+        ));
+        assert!(should_force_refresh_file_state(
+            FILE_STATE_REVALIDATE_INTERVAL_POLLS
+        ));
+    }
 }
