@@ -1,3 +1,4 @@
-/.codex-spp/
+/.codex-spp/*
+!/.codex-spp/.gitkeep
 
 /target/

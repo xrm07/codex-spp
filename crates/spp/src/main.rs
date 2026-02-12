@@ -667,6 +667,7 @@ fn cmd_drive_start(repo_root: &Path) -> Result<()> {
     let pause = pause_active(&state);
     let mut report = compute_weekly_report(repo_root, &config, &state)?;
     apply_gate(&mut state, &mut report, pause);
+    let include_file_diff = effective_include_file_diff(&config);
 
     let history_path = resolve_history_path(repo_root, &config.transcript)?;
     if !history_path.exists() {
@@ -719,7 +720,7 @@ fn cmd_drive_start(repo_root: &Path) -> Result<()> {
             "config_snapshot": {
                 "chat_source": config.transcript.chat_source,
                 "capture_full_text": config.transcript.capture_full_text,
-                "include_file_diff": config.transcript.include_file_diff,
+                "include_file_diff": include_file_diff,
                 "max_event_bytes": config.transcript.max_event_bytes,
                 "poll_interval_ms": config.transcript.poll_interval_ms
             },
@@ -749,6 +750,7 @@ fn cmd_drive_start(repo_root: &Path) -> Result<()> {
         &control_path,
         &done_path,
         &config.transcript,
+        include_file_diff,
     );
     let recorder_pid = match spawn_recorder(repo_root, &recorder_args) {
         Ok(pid) => pid,
@@ -979,6 +981,7 @@ fn build_recorder_args(
     control_path: &Path,
     done_path: &Path,
     transcript: &TranscriptConfig,
+    include_file_diff: bool,
 ) -> DriveRecordArgs {
     DriveRecordArgs {
         session_id: session_id.to_string(),
@@ -988,12 +991,16 @@ fn build_recorder_args(
         history_offset,
         control_path: control_path.to_path_buf(),
         done_path: done_path.to_path_buf(),
-        include_file_diff: transcript.include_file_diff,
+        include_file_diff,
         capture_full_text: transcript.capture_full_text,
         max_event_bytes: transcript.max_event_bytes,
         poll_interval_ms: transcript.poll_interval_ms,
         exclude: transcript.watch_exclude.clone(),
     }
+}
+
+fn effective_include_file_diff(config: &AppConfig) -> bool {
+    config.diff_snapshot_enabled && config.transcript.include_file_diff
 }
 
 fn spawn_recorder(repo_root: &Path, args: &DriveRecordArgs) -> Result<u32> {
@@ -2344,5 +2351,19 @@ mod tests {
         assert!(should_force_refresh_file_state(
             FILE_STATE_REVALIDATE_INTERVAL_POLLS
         ));
+    }
+
+    #[test]
+    fn effective_include_file_diff_requires_both_flags() {
+        let mut config = AppConfig::default();
+        config.diff_snapshot_enabled = false;
+        config.transcript.include_file_diff = true;
+        assert!(!effective_include_file_diff(&config));
+
+        config.diff_snapshot_enabled = true;
+        assert!(effective_include_file_diff(&config));
+
+        config.transcript.include_file_diff = false;
+        assert!(!effective_include_file_diff(&config));
     }
 }

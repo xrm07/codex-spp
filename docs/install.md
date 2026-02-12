@@ -11,13 +11,14 @@
 1. Build CLI:
    - `cargo build -p spp`
    - (global install option) `cargo install --path crates/spp`
-2. Prepare runtime config:
+2. Initialize runtime directories:
+   - `cargo run -p spp -- init`
+3. Prepare runtime config:
    - `cp template_spp.config.toml .codex-spp/config.toml`
    - keep `[transcript].chat_source = "history_jsonl"` for Drive transcript capture
-3. (Optional) Prepare Codex project config template:
+4. (Optional) Prepare Codex project config template:
+   - `mkdir -p .codex`
    - `cp template_spp.codex.config.toml .codex/config.toml`
-4. Initialize runtime directories:
-   - `cargo run -p spp -- init`
 
 ## Verify
 

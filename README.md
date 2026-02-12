@@ -167,7 +167,8 @@ Main settings:
 - `[attribution].codex_author_emails`
 
 Tip: for large repositories, increase `[transcript].poll_interval_ms` to reduce recorder I/O load.
-Note: `diff_snapshot_enabled` is currently reserved and does not change runtime behavior yet.
+Note: `file_diff` capture is enabled only when both `diff_snapshot_enabled = true`
+and `[transcript].include_file_diff = true`.
 
 ## Logs and Data Layout
 
