@@ -8,9 +8,11 @@
 - `spp drive stop`: stop active Drive session and finalize transcript.
 - `spp drive status`: show Drive mode/session state.
 - `spp drive`: shorthand for `spp drive start`.
-- `spp pause --hours 24`: pause gate checks temporarily (max 24h).
+- `spp pause --hours 24`: pause gate checks temporarily (`--hours` is clamped to `1..24`).
 - `spp resume`: clear pause and resume gate checks.
-- `spp reset`: reset weekly state and manual attribution overrides.
+- `spp reset`: reset state (including manual attribution overrides) and clear files in
+  `.codex-spp/weekly/`, `.codex-spp/transcripts/`, and `.codex-spp/runtime/`
+  (session logs in `.codex-spp/sessions/` are not removed).
 - `spp codex`: launch Codex with enforced sandbox/approval flags.
 - `spp project init [PROJECT]`: scaffold SPP assets into another project.
 
