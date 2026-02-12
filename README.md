@@ -69,6 +69,7 @@ spp pause --hours <1..24>
 spp resume
 spp reset
 spp codex [--dry-run] [EXTRA...]
+spp project init [PROJECT] [--with-codex-config] [--force]
 spp attrib fix --actor <human|ai> <commit>
 ```
 
@@ -88,8 +89,21 @@ spp attrib fix --actor <human|ai> <commit>
   Resets state and clears weekly report files.
 - `codex`
   Applies gate logic, logs session metadata, and launches Codex with enforced flags.
+- `project init`
+  Scaffolds SPP assets into a target project directory (`AGENTS.md`, `.agents`, `skills`,
+  `.codex-spp/config.toml`, and `.gitignore` rule for `/.codex-spp/`).
 - `attrib fix`
   Saves manual attribution override for a commit hash.
+
+### Bootstrap another project with one command
+
+```bash
+# from any directory
+spp project init /path/to/your-project --with-codex-config
+```
+
+- Default behavior skips existing files.
+- Add `--force` to overwrite existing files.
 
 ## Mode and Gate Behavior
 

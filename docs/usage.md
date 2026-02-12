@@ -9,6 +9,7 @@
 - `spp resume`: clear pause and resume gate checks.
 - `spp reset`: reset weekly state and manual attribution overrides.
 - `spp codex`: launch Codex with enforced sandbox/approval flags.
+- `spp project init <project>`: scaffold SPP assets into another project.
 
 ## Attribution
 
@@ -16,3 +17,8 @@
 - `spp attrib fix <commit> --actor ai`
 
 Manual overrides are persisted in `.codex-spp/state.json` and take highest priority.
+
+## Project Bootstrap Example
+
+- `spp project init /path/to/your-project --with-codex-config`
+- add `--force` when you want to overwrite existing files.
