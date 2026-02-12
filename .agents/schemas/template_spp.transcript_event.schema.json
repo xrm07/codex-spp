@@ -1,0 +1,50 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://codex-spp.local/schemas/template_spp.transcript_event.schema.json",
+  "title": "codex-spp transcript event",
+  "type": "object",
+  "required": [
+    "log_schema_version",
+    "event_id",
+    "session_id",
+    "event_type",
+    "timestamp",
+    "mode"
+  ],
+  "properties": {
+    "log_schema_version": {
+      "type": "string"
+    },
+    "event_id": {
+      "type": "string"
+    },
+    "session_id": {
+      "type": "string"
+    },
+    "event_type": {
+      "type": "string",
+      "enum": [
+        "session_start",
+        "session_end",
+        "chat_user",
+        "chat_assistant",
+        "file_diff"
+      ]
+    },
+    "timestamp": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "mode": {
+      "type": "string",
+      "enum": ["normal", "drive"]
+    },
+    "payload": {
+      "type": ["object", "null"]
+    },
+    "notes": {
+      "type": ["string", "null"]
+    }
+  },
+  "additionalProperties": false
+}

@@ -1,24 +1,43 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::env;
 use std::ffi::OsStr;
 use std::fs::{self, File, OpenOptions};
-use std::io::Write;
+use std::io::{BufRead, BufReader, ErrorKind, Read, Seek, SeekFrom, Write};
+#[cfg(unix)]
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
-use std::process::Command;
-use std::time::SystemTime;
+use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
+use std::thread::sleep;
+use std::time::{Duration as StdDuration, Instant, SystemTime};
 
 use anyhow::{bail, Context, Result};
 use chrono::{DateTime, Datelike, Duration, NaiveDate, Utc, Weekday};
-use clap::{Args, Parser, Subcommand, ValueEnum};
+use clap::{ArgAction, Args, Parser, Subcommand, ValueEnum};
 use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
+use similar::TextDiff;
+use walkdir::WalkDir;
 
 const RUNTIME_CONFIG: &str = ".codex-spp/config.toml";
 const STATE_FILE: &str = ".codex-spp/state.json";
 const SESSION_DIR: &str = ".codex-spp/sessions";
 const WEEKLY_DIR: &str = ".codex-spp/weekly";
+const TRANSCRIPT_DIR: &str = ".codex-spp/transcripts";
+const RUNTIME_DIR: &str = ".codex-spp/runtime";
 const TEMPLATE_CONFIG: &str = "template_spp.config.toml";
 const PROJECT_RUNTIME_CONFIG_FILE: &str = ".codex-spp/config.toml";
 const PROJECT_CODEX_CONFIG_FILE: &str = ".codex/config.toml";
 const GITIGNORE_RULE_CODEX_SPP: &str = "/.codex-spp/";
+const DEFAULT_HISTORY_PATH: &str = "auto";
+const DEFAULT_CHAT_SOURCE: &str = "history_jsonl";
+const DEFAULT_TRANSCRIPT_EVENT_MAX_BYTES: u64 = 64_000;
+const DEFAULT_POLL_INTERVAL_MS: u64 = 2000;
+const MAX_RECORDER_ERRORS: usize = 50;
+const FILE_STATE_REVALIDATE_INTERVAL_POLLS: u64 = 30;
+
+static EVENT_COUNTER: AtomicU64 = AtomicU64::new(1);
 
 const PROJECT_ASSETS: &[(&str, &str)] = &[
     ("AGENTS.md", include_str!("../../../AGENTS.md")),
@@ -47,16 +66,32 @@ const PROJECT_ASSETS: &[(&str, &str)] = &[
         include_str!("../../../.agents/schemas/template_spp.weekly_report.schema.json"),
     ),
     (
+        ".agents/schemas/template_spp.transcript_event.schema.json",
+        include_str!("../../../.agents/schemas/template_spp.transcript_event.schema.json"),
+    ),
+    (
+        ".agents/skills/spp-drive/SKILL.md",
+        include_str!("../../../.agents/skills/spp-drive/SKILL.md"),
+    ),
+    (
+        ".agents/skills/spp-coach/SKILL.md",
+        include_str!("../../../.agents/skills/spp-coach/SKILL.md"),
+    ),
+    (
+        ".agents/skills/spp-stats/SKILL.md",
+        include_str!("../../../.agents/skills/spp-stats/SKILL.md"),
+    ),
+    (
         "skills/spp-drive/SKILL.md",
-        include_str!("../../../skills/spp-drive/SKILL.md"),
+        include_str!("../../../.agents/skills/spp-drive/SKILL.md"),
     ),
     (
         "skills/spp-coach/SKILL.md",
-        include_str!("../../../skills/spp-coach/SKILL.md"),
+        include_str!("../../../.agents/skills/spp-coach/SKILL.md"),
     ),
     (
         "skills/spp-stats/SKILL.md",
-        include_str!("../../../skills/spp-stats/SKILL.md"),
+        include_str!("../../../.agents/skills/spp-stats/SKILL.md"),
     ),
 ];
 
@@ -74,7 +109,7 @@ struct Cli {
 enum Commands {
     Init,
     Status,
-    Drive,
+    Drive(DriveArgs),
     Pause(PauseArgs),
     Resume,
     Reset,
@@ -101,6 +136,49 @@ struct CodexArgs {
     dry_run: bool,
     #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
     extra: Vec<String>,
+}
+
+#[derive(Args, Debug, Default)]
+struct DriveArgs {
+    #[command(subcommand)]
+    command: Option<DriveSubcommand>,
+}
+
+#[derive(Subcommand, Debug)]
+enum DriveSubcommand {
+    Start,
+    Stop,
+    Status,
+    #[command(hide = true)]
+    Record(DriveRecordArgs),
+}
+
+#[derive(Args, Debug, Clone)]
+struct DriveRecordArgs {
+    #[arg(long)]
+    session_id: String,
+    #[arg(long)]
+    log_schema_version: String,
+    #[arg(long)]
+    transcript_path: PathBuf,
+    #[arg(long)]
+    history_path: PathBuf,
+    #[arg(long)]
+    history_offset: u64,
+    #[arg(long)]
+    control_path: PathBuf,
+    #[arg(long)]
+    done_path: PathBuf,
+    #[arg(long, default_value_t = true, action = ArgAction::Set)]
+    include_file_diff: bool,
+    #[arg(long, default_value_t = true, action = ArgAction::Set)]
+    capture_full_text: bool,
+    #[arg(long, default_value_t = DEFAULT_TRANSCRIPT_EVENT_MAX_BYTES)]
+    max_event_bytes: u64,
+    #[arg(long, default_value_t = DEFAULT_POLL_INTERVAL_MS)]
+    poll_interval_ms: u64,
+    #[arg(long)]
+    exclude: Vec<String>,
 }
 
 #[derive(Subcommand, Debug)]
@@ -167,6 +245,7 @@ struct AppConfig {
     max_log_bytes: u64,
     diff_snapshot_enabled: bool,
     codex: CodexConfig,
+    transcript: TranscriptConfig,
     attribution: AttributionConfig,
 }
 
@@ -186,6 +265,18 @@ struct CodexModeConfig {
     approval: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+struct TranscriptConfig {
+    chat_source: String,
+    history_path: String,
+    capture_full_text: bool,
+    max_event_bytes: u64,
+    include_file_diff: bool,
+    watch_exclude: Vec<String>,
+    poll_interval_ms: u64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 struct AttributionConfig {
     codex_author_emails: Vec<String>,
@@ -194,11 +285,12 @@ struct AttributionConfig {
 impl Default for AppConfig {
     fn default() -> Self {
         Self {
-            log_schema_version: "1.0".to_string(),
+            log_schema_version: "1.1".to_string(),
             weekly_ratio_target: 0.70,
             max_log_bytes: 524_288_000,
             diff_snapshot_enabled: false,
             codex: CodexConfig::default(),
+            transcript: TranscriptConfig::default(),
             attribution: AttributionConfig::default(),
         }
     }
@@ -222,6 +314,24 @@ impl Default for CodexModeConfig {
     }
 }
 
+impl Default for TranscriptConfig {
+    fn default() -> Self {
+        Self {
+            chat_source: DEFAULT_CHAT_SOURCE.to_string(),
+            history_path: DEFAULT_HISTORY_PATH.to_string(),
+            capture_full_text: true,
+            max_event_bytes: DEFAULT_TRANSCRIPT_EVENT_MAX_BYTES,
+            include_file_diff: true,
+            watch_exclude: vec![
+                ".git/".to_string(),
+                ".codex-spp/".to_string(),
+                "target/".to_string(),
+            ],
+            poll_interval_ms: DEFAULT_POLL_INTERVAL_MS,
+        }
+    }
+}
+
 fn default_codex_mode_normal() -> CodexModeConfig {
     CodexModeConfig {
         sandbox: "workspace-write".to_string(),
@@ -237,12 +347,26 @@ fn default_codex_mode_drive() -> CodexModeConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 struct State {
     mode: Mode,
     drive_reason: Option<String>,
     pause_until: Option<DateTime<Utc>>,
     attribution_overrides: HashMap<String, Actor>,
+    active_drive_session: Option<ActiveDriveSession>,
     updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ActiveDriveSession {
+    session_id: String,
+    started_at: DateTime<Utc>,
+    history_path: String,
+    history_offset: u64,
+    transcript_path: String,
+    control_path: String,
+    done_path: String,
+    recorder_pid: Option<u32>,
 }
 
 impl Default for State {
@@ -252,7 +376,60 @@ impl Default for State {
             drive_reason: None,
             pause_until: None,
             attribution_overrides: HashMap::new(),
+            active_drive_session: None,
             updated_at: Utc::now(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct TranscriptEvent {
+    log_schema_version: String,
+    event_id: String,
+    session_id: String,
+    event_type: String,
+    timestamp: DateTime<Utc>,
+    mode: Mode,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    payload: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    notes: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct RecorderDone {
+    session_id: String,
+    finished_at: DateTime<Utc>,
+    history_offset: u64,
+    chat_events: u64,
+    diff_events: u64,
+    errors: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+struct ChatMessage {
+    role: String,
+    content: String,
+    message_id: Option<String>,
+    raw: Option<Value>,
+}
+
+#[derive(Debug, Clone)]
+struct FileState {
+    len: u64,
+    modified: Option<SystemTime>,
+    content: Arc<str>,
+}
+
+impl Default for RecorderDone {
+    fn default() -> Self {
+        Self {
+            session_id: String::new(),
+            finished_at: Utc::now(),
+            history_offset: 0,
+            chat_events: 0,
+            diff_events: 0,
+            errors: Vec::new(),
         }
     }
 }
@@ -317,7 +494,7 @@ fn main() -> Result<()> {
             match other {
                 Commands::Init => cmd_init(&repo_root),
                 Commands::Status => cmd_status(&repo_root),
-                Commands::Drive => cmd_drive(&repo_root),
+                Commands::Drive(args) => cmd_drive(&repo_root, args),
                 Commands::Pause(args) => cmd_pause(&repo_root, args),
                 Commands::Resume => cmd_resume(&repo_root),
                 Commands::Reset => cmd_reset(&repo_root),
@@ -404,6 +581,10 @@ fn cmd_init(repo_root: &Path) -> Result<()> {
         .with_context(|| "failed to create session log directory")?;
     fs::create_dir_all(repo_root.join(WEEKLY_DIR))
         .with_context(|| "failed to create weekly report directory")?;
+    fs::create_dir_all(repo_root.join(TRANSCRIPT_DIR))
+        .with_context(|| "failed to create transcript directory")?;
+    fs::create_dir_all(repo_root.join(RUNTIME_DIR))
+        .with_context(|| "failed to create runtime directory")?;
 
     let runtime_cfg_path = repo_root.join(RUNTIME_CONFIG);
     if !runtime_cfg_path.exists() {
@@ -460,15 +641,975 @@ fn cmd_status(repo_root: &Path) -> Result<()> {
     Ok(())
 }
 
-fn cmd_drive(repo_root: &Path) -> Result<()> {
+fn cmd_drive(repo_root: &Path, args: DriveArgs) -> Result<()> {
+    match args.command.unwrap_or(DriveSubcommand::Start) {
+        DriveSubcommand::Start => cmd_drive_start(repo_root),
+        DriveSubcommand::Stop => cmd_drive_stop(repo_root),
+        DriveSubcommand::Status => cmd_drive_status(repo_root),
+        DriveSubcommand::Record(args) => cmd_drive_record(repo_root, args),
+    }
+}
+
+fn cmd_drive_start(repo_root: &Path) -> Result<()> {
     ensure_runtime_dirs(repo_root)?;
+    let config = load_config(repo_root)?;
+    validate_transcript_source(&config.transcript)?;
+
     let mut state = load_state(repo_root)?;
+    if let Some(active) = &state.active_drive_session {
+        bail!(
+            "drive session already active: {} (stop it first with `spp drive stop`)",
+            active.session_id
+        );
+    }
+
+    refresh_pause(&mut state);
+    let pause = pause_active(&state);
+    let mut report = compute_weekly_report(repo_root, &config, &state)?;
+    apply_gate(&mut state, &mut report, pause);
+
+    let history_path = resolve_history_path(repo_root, &config.transcript)?;
+    if !history_path.exists() {
+        bail!(
+            "history file not found: {}. Ensure Codex history persistence is enabled.",
+            history_path.display()
+        );
+    }
+    let metadata = fs::metadata(&history_path)
+        .with_context(|| format!("failed to stat history file {}", history_path.display()))?;
+    let history_offset = metadata.len();
+
+    let session_id = generate_session_id();
+    let transcript_path = repo_root
+        .join(TRANSCRIPT_DIR)
+        .join(format!("{session_id}.jsonl"));
+    let control_path = repo_root
+        .join(RUNTIME_DIR)
+        .join(format!("{session_id}.control"));
+    let done_path = repo_root
+        .join(RUNTIME_DIR)
+        .join(format!("{session_id}.done"));
+
+    if let Some(parent) = transcript_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    if let Some(parent) = control_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(&control_path, "run\n")
+        .with_context(|| format!("failed to write {}", control_path.display()))?;
+    if done_path.exists() {
+        fs::remove_file(&done_path)
+            .with_context(|| format!("failed to clean stale {}", done_path.display()))?;
+    }
+
     state.mode = Mode::Drive;
-    state.drive_reason = Some("manual".to_string());
-    state.updated_at = Utc::now();
+    if state.drive_reason.as_deref() != Some("gate") {
+        state.drive_reason = Some("manual".to_string());
+    }
+
+    let start_event = TranscriptEvent {
+        log_schema_version: config.log_schema_version.clone(),
+        event_id: generate_event_id(),
+        session_id: session_id.clone(),
+        event_type: "session_start".to_string(),
+        timestamp: Utc::now(),
+        mode: state.mode.clone(),
+        payload: Some(json!({
+            "config_snapshot": {
+                "chat_source": config.transcript.chat_source,
+                "capture_full_text": config.transcript.capture_full_text,
+                "include_file_diff": config.transcript.include_file_diff,
+                "max_event_bytes": config.transcript.max_event_bytes,
+                "poll_interval_ms": config.transcript.poll_interval_ms
+            },
+            "history": {
+                "path": history_path.to_string_lossy(),
+                "offset": history_offset,
+                "inode": file_inode(&metadata)
+            },
+            "git": {
+                "branch": git_output(repo_root, &["rev-parse", "--abbrev-ref", "HEAD"])
+                    .unwrap_or_else(|_| "unknown".to_string())
+                    .trim()
+                    .to_string(),
+                "commit": git_output(repo_root, &["rev-parse", "HEAD"]).ok().map(|s| s.trim().to_string())
+            }
+        })),
+        notes: None,
+    };
+    write_transcript_event(&transcript_path, &start_event)?;
+
+    let recorder_args = build_recorder_args(
+        &session_id,
+        &config.log_schema_version,
+        &transcript_path,
+        &history_path,
+        history_offset,
+        &control_path,
+        &done_path,
+        &config.transcript,
+    );
+    let recorder_pid = match spawn_recorder(repo_root, &recorder_args) {
+        Ok(pid) => pid,
+        Err(err) => {
+            let spawn_error_message = format!("{err:#}");
+            let _ = append_start_failed_session_end(
+                &transcript_path,
+                &config.log_schema_version,
+                &session_id,
+                state.mode.clone(),
+                &spawn_error_message,
+            );
+            let _ = fs::remove_file(&control_path);
+            if done_path.exists() {
+                let _ = fs::remove_file(&done_path);
+            }
+            return Err(err);
+        }
+    };
+
+    state.active_drive_session = Some(ActiveDriveSession {
+        session_id: session_id.clone(),
+        started_at: Utc::now(),
+        history_path: history_path.to_string_lossy().to_string(),
+        history_offset,
+        transcript_path: transcript_path.to_string_lossy().to_string(),
+        control_path: control_path.to_string_lossy().to_string(),
+        done_path: done_path.to_string_lossy().to_string(),
+        recorder_pid: Some(recorder_pid),
+    });
+
     save_state(repo_root, &state)?;
-    println!("mode switched to drive");
+    write_weekly_report(repo_root, &report)?;
+    enforce_log_size(repo_root, config.max_log_bytes)?;
+
+    println!("drive session started: {}", session_id);
+    println!("transcript: {}", transcript_path.display());
+    println!("history source: {}", history_path.display());
     Ok(())
+}
+
+fn cmd_drive_stop(repo_root: &Path) -> Result<()> {
+    ensure_runtime_dirs(repo_root)?;
+    let config = load_config(repo_root)?;
+    let mut state = load_state(repo_root)?;
+
+    let active = match state.active_drive_session.clone() {
+        Some(active) => active,
+        None => bail!("no active drive session"),
+    };
+
+    let control_path = PathBuf::from(&active.control_path);
+    let done_path = PathBuf::from(&active.done_path);
+    let transcript_path = PathBuf::from(&active.transcript_path);
+
+    fs::write(&control_path, "stop\n")
+        .with_context(|| format!("failed to write {}", control_path.display()))?;
+
+    let wait_timeout = stop_wait_timeout(&config);
+    let done = wait_for_recorder_done(&done_path, wait_timeout)?;
+    let timeout = done.is_none();
+    let mut timeout_errors = Vec::new();
+    if timeout {
+        if let Some(pid) = active.recorder_pid {
+            if let Err(err) = terminate_recorder_process(pid) {
+                timeout_errors.push(format!(
+                    "recorder did not finish in time; failed to terminate pid {}: {}",
+                    pid, err
+                ));
+            } else {
+                timeout_errors.push(format!(
+                    "recorder did not finish in time; sent termination signal to pid {}",
+                    pid
+                ));
+            }
+        } else {
+            timeout_errors.push("recorder did not finish in time (pid unavailable)".to_string());
+        }
+    }
+    let done = match done {
+        Some(done) => done,
+        None => RecorderDone {
+            session_id: active.session_id.clone(),
+            finished_at: Utc::now(),
+            history_offset: active.history_offset,
+            chat_events: 0,
+            diff_events: 0,
+            errors: if timeout_errors.is_empty() {
+                vec!["recorder did not finish in time".to_string()]
+            } else {
+                timeout_errors
+            },
+        },
+    };
+
+    let end_event = TranscriptEvent {
+        log_schema_version: config.log_schema_version.clone(),
+        event_id: generate_event_id(),
+        session_id: active.session_id.clone(),
+        event_type: "session_end".to_string(),
+        timestamp: Utc::now(),
+        mode: state.mode.clone(),
+        payload: Some(json!({
+            "stats": {
+                "chat_events": done.chat_events,
+                "diff_events": done.diff_events,
+                "duration_sec": (Utc::now() - active.started_at).num_seconds().max(0),
+                "history_offset": done.history_offset
+            },
+            "reason": if timeout { "manual_stop_timeout" } else { "manual_stop" },
+            "errors": done.errors.clone()
+        })),
+        notes: None,
+    };
+    write_transcript_event(&transcript_path, &end_event)?;
+
+    if state.mode == Mode::Drive && state.drive_reason.as_deref() == Some("manual") {
+        state.mode = Mode::Normal;
+        state.drive_reason = None;
+    }
+    state.active_drive_session = None;
+    save_state(repo_root, &state)?;
+
+    if !timeout {
+        let _ = fs::remove_file(control_path);
+        let _ = fs::remove_file(done_path);
+    }
+
+    println!("drive session stopped: {}", active.session_id);
+    println!(
+        "summary: chat_events={}, diff_events={}",
+        done.chat_events, done.diff_events
+    );
+    Ok(())
+}
+
+fn cmd_drive_status(repo_root: &Path) -> Result<()> {
+    ensure_runtime_dirs(repo_root)?;
+    let state = load_state(repo_root)?;
+    println!("mode: {:?}", state.mode);
+    println!(
+        "drive_reason: {}",
+        state.drive_reason.unwrap_or_else(|| "none".to_string())
+    );
+    if let Some(active) = state.active_drive_session {
+        println!("active_session: {}", active.session_id);
+        println!("started_at: {}", active.started_at.to_rfc3339());
+        println!("history_path: {}", active.history_path);
+        println!("transcript_path: {}", active.transcript_path);
+        println!(
+            "recorder_pid: {}",
+            active
+                .recorder_pid
+                .map(|pid| pid.to_string())
+                .unwrap_or_else(|| "unknown".to_string())
+        );
+    } else {
+        println!("active_session: none");
+    }
+    Ok(())
+}
+
+fn cmd_drive_record(repo_root: &Path, args: DriveRecordArgs) -> Result<()> {
+    ensure_runtime_dirs(repo_root)?;
+    let summary = run_drive_recorder_loop(repo_root, &args).unwrap_or_else(|err| RecorderDone {
+        session_id: args.session_id.clone(),
+        finished_at: Utc::now(),
+        history_offset: args.history_offset,
+        chat_events: 0,
+        diff_events: 0,
+        errors: vec![format!("{err:#}")],
+    });
+    write_recorder_done(&args.done_path, &summary)?;
+    Ok(())
+}
+
+fn validate_transcript_source(config: &TranscriptConfig) -> Result<()> {
+    if config.chat_source == DEFAULT_CHAT_SOURCE {
+        return Ok(());
+    }
+    bail!(
+        "unsupported transcript chat_source `{}` (supported: `{}`)",
+        config.chat_source,
+        DEFAULT_CHAT_SOURCE
+    );
+}
+
+fn resolve_history_path(repo_root: &Path, config: &TranscriptConfig) -> Result<PathBuf> {
+    if config.history_path == DEFAULT_HISTORY_PATH {
+        let codex_home = env::var("CODEX_HOME").ok().map(PathBuf::from).or_else(|| {
+            env::var("HOME")
+                .ok()
+                .map(|home| PathBuf::from(home).join(".codex"))
+        });
+        if let Some(codex_home) = codex_home {
+            return Ok(codex_home.join("history.jsonl"));
+        }
+        bail!("failed to resolve history path: set CODEX_HOME or HOME");
+    }
+
+    let path = expand_tilde_path(&config.history_path);
+    if path.is_absolute() {
+        return Ok(path);
+    }
+    Ok(repo_root.join(path))
+}
+
+fn expand_tilde_path(raw: &str) -> PathBuf {
+    if raw == "~" {
+        if let Ok(home) = env::var("HOME") {
+            return PathBuf::from(home);
+        }
+    }
+    if let Some(rest) = raw.strip_prefix("~/") {
+        if let Ok(home) = env::var("HOME") {
+            return PathBuf::from(home).join(rest);
+        }
+    }
+    PathBuf::from(raw)
+}
+
+fn build_recorder_args(
+    session_id: &str,
+    log_schema_version: &str,
+    transcript_path: &Path,
+    history_path: &Path,
+    history_offset: u64,
+    control_path: &Path,
+    done_path: &Path,
+    transcript: &TranscriptConfig,
+) -> DriveRecordArgs {
+    DriveRecordArgs {
+        session_id: session_id.to_string(),
+        log_schema_version: log_schema_version.to_string(),
+        transcript_path: transcript_path.to_path_buf(),
+        history_path: history_path.to_path_buf(),
+        history_offset,
+        control_path: control_path.to_path_buf(),
+        done_path: done_path.to_path_buf(),
+        include_file_diff: transcript.include_file_diff,
+        capture_full_text: transcript.capture_full_text,
+        max_event_bytes: transcript.max_event_bytes,
+        poll_interval_ms: transcript.poll_interval_ms,
+        exclude: transcript.watch_exclude.clone(),
+    }
+}
+
+fn spawn_recorder(repo_root: &Path, args: &DriveRecordArgs) -> Result<u32> {
+    let current_exe = env::current_exe().with_context(|| "failed to resolve current executable")?;
+    let mut command = Command::new(current_exe);
+    command
+        .current_dir(repo_root)
+        .arg("drive")
+        .arg("record")
+        .arg("--session-id")
+        .arg(&args.session_id)
+        .arg("--log-schema-version")
+        .arg(&args.log_schema_version)
+        .arg("--transcript-path")
+        .arg(&args.transcript_path)
+        .arg("--history-path")
+        .arg(&args.history_path)
+        .arg("--history-offset")
+        .arg(args.history_offset.to_string())
+        .arg("--control-path")
+        .arg(&args.control_path)
+        .arg("--done-path")
+        .arg(&args.done_path)
+        .arg("--include-file-diff")
+        .arg(args.include_file_diff.to_string())
+        .arg("--capture-full-text")
+        .arg(args.capture_full_text.to_string())
+        .arg("--max-event-bytes")
+        .arg(args.max_event_bytes.to_string())
+        .arg("--poll-interval-ms")
+        .arg(args.poll_interval_ms.to_string())
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    for pattern in &args.exclude {
+        command.arg("--exclude").arg(pattern);
+    }
+    let child = command
+        .spawn()
+        .with_context(|| "failed to spawn drive recorder process")?;
+    Ok(child.id())
+}
+
+fn wait_for_recorder_done(path: &Path, timeout: StdDuration) -> Result<Option<RecorderDone>> {
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        if path.exists() {
+            let raw = fs::read_to_string(path)
+                .with_context(|| format!("failed to read {}", path.display()))?;
+            let done: RecorderDone =
+                serde_json::from_str(&raw).with_context(|| "failed to parse recorder done file")?;
+            return Ok(Some(done));
+        }
+        sleep(StdDuration::from_millis(200));
+    }
+    Ok(None)
+}
+
+fn stop_wait_timeout(config: &AppConfig) -> StdDuration {
+    let poll_ms = config.transcript.poll_interval_ms.max(100);
+    let dynamic_ms = poll_ms.saturating_mul(3);
+    let wait_ms = dynamic_ms.max(15_000);
+    StdDuration::from_millis(wait_ms)
+}
+
+fn terminate_recorder_process(pid: u32) -> Result<()> {
+    #[cfg(unix)]
+    {
+        let status = Command::new("kill")
+            .arg("-TERM")
+            .arg(pid.to_string())
+            .status()
+            .with_context(|| "failed to execute kill command")?;
+        if !status.success() {
+            bail!("kill -TERM {} exited with status {}", pid, status);
+        }
+        return Ok(());
+    }
+
+    #[cfg(windows)]
+    {
+        let status = Command::new("taskkill")
+            .args(["/PID", &pid.to_string(), "/T", "/F"])
+            .status()
+            .with_context(|| "failed to execute taskkill command")?;
+        if !status.success() {
+            bail!("taskkill {} exited with status {}", pid, status);
+        }
+        return Ok(());
+    }
+
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = pid;
+        bail!("recorder termination is not supported on this platform");
+    }
+}
+
+fn write_recorder_done(path: &Path, done: &RecorderDone) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let content = serde_json::to_string_pretty(done)?;
+    fs::write(path, content).with_context(|| format!("failed to write {}", path.display()))
+}
+
+fn run_drive_recorder_loop(repo_root: &Path, args: &DriveRecordArgs) -> Result<RecorderDone> {
+    let mut history_offset = args.history_offset;
+    let mut snapshot = if args.include_file_diff {
+        capture_workspace_text_files(repo_root, &args.exclude, None, false)?
+    } else {
+        HashMap::new()
+    };
+    let mut chat_events = 0_u64;
+    let mut diff_events = 0_u64;
+    let mut errors = Vec::new();
+    let mut error_seen = HashSet::new();
+    let mut poll_count = 0_u64;
+    let poll_interval = StdDuration::from_millis(args.poll_interval_ms.max(100));
+
+    loop {
+        if should_stop_recorder(&args.control_path) {
+            break;
+        }
+
+        match read_history_values(&args.history_path, history_offset) {
+            Ok((next_offset, values)) => {
+                history_offset = next_offset;
+                for value in values {
+                    let messages = extract_chat_messages(&value, args.max_event_bytes);
+                    for message in messages {
+                        let event_type = if message.role == "assistant" {
+                            "chat_assistant"
+                        } else {
+                            "chat_user"
+                        };
+                        let content = if args.capture_full_text {
+                            truncate_to_bytes(&message.content, args.max_event_bytes)
+                        } else {
+                            truncate_to_bytes(
+                                &summarize_text(&message.content),
+                                args.max_event_bytes,
+                            )
+                        };
+                        let payload = json!({
+                            "role": message.role,
+                            "message_id": message.message_id,
+                            "content": content,
+                            "raw": message.raw
+                        });
+                        let event = TranscriptEvent {
+                            log_schema_version: args.log_schema_version.clone(),
+                            event_id: generate_event_id(),
+                            session_id: args.session_id.clone(),
+                            event_type: event_type.to_string(),
+                            timestamp: Utc::now(),
+                            mode: Mode::Drive,
+                            payload: Some(payload),
+                            notes: None,
+                        };
+                        if let Err(err) = write_transcript_event(&args.transcript_path, &event) {
+                            push_recorder_error(
+                                &mut errors,
+                                &mut error_seen,
+                                format!("failed to write chat event: {err:#}"),
+                            );
+                        } else {
+                            chat_events += 1;
+                        }
+                    }
+                }
+            }
+            Err(err) => push_recorder_error(
+                &mut errors,
+                &mut error_seen,
+                format!("failed to read history stream: {err:#}"),
+            ),
+        }
+
+        if should_stop_recorder(&args.control_path) {
+            break;
+        }
+
+        if args.include_file_diff {
+            poll_count = poll_count.saturating_add(1);
+            let force_content_refresh = should_force_refresh_file_state(poll_count);
+            match capture_workspace_text_files(
+                repo_root,
+                &args.exclude,
+                Some(&snapshot),
+                force_content_refresh,
+            ) {
+                Ok(next_snapshot) => {
+                    let mut paths: HashSet<String> = HashSet::new();
+                    paths.extend(snapshot.keys().cloned());
+                    paths.extend(next_snapshot.keys().cloned());
+                    let mut paths = paths.into_iter().collect::<Vec<_>>();
+                    paths.sort();
+                    for path in paths {
+                        let before = snapshot.get(&path).map(|state| state.content.as_ref());
+                        let after = next_snapshot.get(&path).map(|state| state.content.as_ref());
+                        if before == after {
+                            continue;
+                        }
+                        if let Some(diff) = build_unified_diff(before, after, &path) {
+                            let payload = json!({
+                                "path": path,
+                                "diff_unified": truncate_to_bytes(&diff, args.max_event_bytes),
+                                "bytes": diff.len(),
+                                "language": guess_language(&path),
+                            });
+                            let event = TranscriptEvent {
+                                log_schema_version: args.log_schema_version.clone(),
+                                event_id: generate_event_id(),
+                                session_id: args.session_id.clone(),
+                                event_type: "file_diff".to_string(),
+                                timestamp: Utc::now(),
+                                mode: Mode::Drive,
+                                payload: Some(payload),
+                                notes: None,
+                            };
+                            if let Err(err) = write_transcript_event(&args.transcript_path, &event)
+                            {
+                                push_recorder_error(
+                                    &mut errors,
+                                    &mut error_seen,
+                                    format!("failed to write diff event: {err:#}"),
+                                );
+                            } else {
+                                diff_events += 1;
+                            }
+                        }
+                    }
+                    snapshot = next_snapshot;
+                }
+                Err(err) => push_recorder_error(
+                    &mut errors,
+                    &mut error_seen,
+                    format!("failed to capture workspace snapshot: {err:#}"),
+                ),
+            }
+        }
+
+        sleep(poll_interval);
+    }
+
+    Ok(RecorderDone {
+        session_id: args.session_id.clone(),
+        finished_at: Utc::now(),
+        history_offset,
+        chat_events,
+        diff_events,
+        errors,
+    })
+}
+
+fn push_recorder_error(errors: &mut Vec<String>, seen: &mut HashSet<String>, message: String) {
+    let truncated_marker = "__truncated__";
+    if errors.len() >= MAX_RECORDER_ERRORS + 1 {
+        return;
+    }
+
+    if !seen.insert(message.clone()) {
+        return;
+    }
+
+    errors.push(message);
+    if errors.len() == MAX_RECORDER_ERRORS && !seen.contains(truncated_marker) {
+        let _ = seen.insert(truncated_marker.to_string());
+        errors.push(format!(
+            "recorder errors truncated at {} unique entries",
+            MAX_RECORDER_ERRORS
+        ));
+    }
+}
+
+fn should_stop_recorder(control_path: &Path) -> bool {
+    match fs::read_to_string(control_path) {
+        Ok(value) => value.trim() == "stop",
+        Err(err) if err.kind() == ErrorKind::NotFound => true,
+        Err(_) => true,
+    }
+}
+
+fn read_history_values(path: &Path, offset: u64) -> Result<(u64, Vec<Value>)> {
+    let mut file =
+        File::open(path).with_context(|| format!("failed to open {}", path.display()))?;
+    file.seek(SeekFrom::Start(offset))
+        .with_context(|| format!("failed to seek {}", path.display()))?;
+    let mut reader = BufReader::new(file);
+    let mut current_offset = offset;
+    let mut values = Vec::new();
+
+    loop {
+        let mut line = String::new();
+        let offset_before_read = current_offset;
+        let bytes_read = reader.read_line(&mut line)?;
+        if bytes_read == 0 {
+            break;
+        }
+
+        if !line.ends_with('\n') {
+            reader
+                .get_mut()
+                .seek(SeekFrom::Start(offset_before_read))
+                .with_context(|| format!("failed to rewind {}", path.display()))?;
+            current_offset = offset_before_read;
+            break;
+        }
+
+        let line = line.trim();
+        current_offset += bytes_read as u64;
+        if line.is_empty() {
+            continue;
+        }
+
+        match serde_json::from_str::<Value>(line) {
+            Ok(value) => values.push(value),
+            Err(_) => {
+                reader
+                    .get_mut()
+                    .seek(SeekFrom::Start(offset_before_read))
+                    .with_context(|| format!("failed to rewind {}", path.display()))?;
+                current_offset = offset_before_read;
+                break;
+            }
+        }
+    }
+
+    Ok((current_offset, values))
+}
+
+fn should_force_refresh_file_state(poll_count: u64) -> bool {
+    poll_count > 0 && poll_count % FILE_STATE_REVALIDATE_INTERVAL_POLLS == 0
+}
+
+fn extract_chat_messages(value: &Value, max_event_bytes: u64) -> Vec<ChatMessage> {
+    if let Some(messages) = value.get("messages").and_then(Value::as_array) {
+        let mut out = Vec::new();
+        for item in messages {
+            if let Some(msg) = extract_single_chat_message(item, max_event_bytes) {
+                out.push(msg);
+            }
+        }
+        return out;
+    }
+
+    extract_single_chat_message(value, max_event_bytes)
+        .map(|msg| vec![msg])
+        .unwrap_or_default()
+}
+
+fn extract_single_chat_message(value: &Value, max_event_bytes: u64) -> Option<ChatMessage> {
+    let role = resolve_chat_role(value)?;
+    let content_value = value
+        .pointer("/message/content")
+        .or_else(|| value.get("content"))
+        .or_else(|| value.pointer("/message/text"))
+        .or_else(|| value.get("text"))?;
+    let content = flatten_content(content_value)?;
+    if content.trim().is_empty() {
+        return None;
+    }
+    let content = truncate_to_bytes(&content, max_event_bytes);
+    let message_id = value
+        .pointer("/message/id")
+        .or_else(|| value.get("id"))
+        .and_then(Value::as_str)
+        .map(ToString::to_string);
+    let raw = {
+        let rendered = serde_json::to_string(value).ok();
+        if let Some(rendered) = rendered {
+            if rendered.len() as u64 <= max_event_bytes {
+                Some(value.clone())
+            } else {
+                None
+            }
+        } else {
+            None
+        }
+    };
+
+    Some(ChatMessage {
+        role: role.to_string(),
+        content,
+        message_id,
+        raw,
+    })
+}
+
+fn resolve_chat_role(value: &Value) -> Option<&'static str> {
+    let candidate = value
+        .pointer("/message/role")
+        .or_else(|| value.get("role"))
+        .or_else(|| value.pointer("/item/role"))
+        .or_else(|| value.get("type"))
+        .and_then(Value::as_str)?;
+    let candidate = candidate.to_lowercase();
+    if candidate.contains("assistant") {
+        return Some("assistant");
+    }
+    if candidate.contains("user") {
+        return Some("user");
+    }
+    None
+}
+
+fn flatten_content(value: &Value) -> Option<String> {
+    if let Some(text) = value.as_str() {
+        return Some(text.to_string());
+    }
+
+    if let Some(arr) = value.as_array() {
+        let mut parts = Vec::new();
+        for item in arr {
+            if let Some(text) = item.as_str() {
+                parts.push(text.to_string());
+                continue;
+            }
+            if let Some(text) = item.get("text").and_then(Value::as_str) {
+                parts.push(text.to_string());
+                continue;
+            }
+            if let Some(text) = item.pointer("/content/text").and_then(Value::as_str) {
+                parts.push(text.to_string());
+            }
+        }
+        if !parts.is_empty() {
+            return Some(parts.join("\n"));
+        }
+    }
+
+    if let Some(obj) = value.as_object() {
+        if let Some(text) = obj.get("text").and_then(Value::as_str) {
+            return Some(text.to_string());
+        }
+    }
+
+    None
+}
+
+fn summarize_text(input: &str) -> String {
+    let normalized = input.split_whitespace().collect::<Vec<_>>().join(" ");
+    truncate_to_bytes(&normalized, 280)
+}
+
+fn truncate_to_bytes(input: &str, max_bytes: u64) -> String {
+    if input.len() as u64 <= max_bytes {
+        return input.to_string();
+    }
+
+    let mut end = 0usize;
+    for (idx, _) in input.char_indices() {
+        if idx as u64 > max_bytes.saturating_sub(14) {
+            break;
+        }
+        end = idx;
+    }
+    let mut out = input[..end].to_string();
+    out.push_str("...[truncated]");
+    out
+}
+
+fn capture_workspace_text_files(
+    repo_root: &Path,
+    exclude: &[String],
+    previous: Option<&HashMap<String, FileState>>,
+    force_content_refresh: bool,
+) -> Result<HashMap<String, FileState>> {
+    let mut snapshot = HashMap::new();
+    for entry in WalkDir::new(repo_root)
+        .follow_links(false)
+        .into_iter()
+        .filter_entry(|entry| should_walk_entry(repo_root, entry.path(), exclude))
+        .filter_map(|entry| entry.ok())
+    {
+        if !entry.file_type().is_file() {
+            continue;
+        }
+        let rel_path = match relative_path_string(repo_root, entry.path()) {
+            Some(rel_path) if !rel_path.is_empty() => rel_path,
+            _ => continue,
+        };
+        if is_excluded_path(&rel_path, exclude) {
+            continue;
+        }
+        let metadata = match entry.metadata() {
+            Ok(metadata) => metadata,
+            Err(_) => continue,
+        };
+        let len = metadata.len();
+        if len > 2_000_000 {
+            continue;
+        }
+        let modified = metadata.modified().ok();
+
+        if let Some(prev) = previous.and_then(|prev| prev.get(&rel_path)) {
+            if should_reuse_previous_file_state(prev, len, modified, force_content_refresh) {
+                snapshot.insert(rel_path, prev.clone());
+                continue;
+            }
+        }
+
+        let mut bytes = Vec::new();
+        if File::open(entry.path())
+            .and_then(|mut file| file.read_to_end(&mut bytes))
+            .is_err()
+        {
+            continue;
+        }
+        if bytes.contains(&0) {
+            continue;
+        }
+        let text = match String::from_utf8(bytes) {
+            Ok(text) => text,
+            Err(_) => continue,
+        };
+        snapshot.insert(
+            rel_path,
+            FileState {
+                len,
+                modified,
+                content: Arc::<str>::from(text),
+            },
+        );
+    }
+    Ok(snapshot)
+}
+
+fn relative_path_string(repo_root: &Path, path: &Path) -> Option<String> {
+    let rel = path.strip_prefix(repo_root).ok()?;
+    Some(rel.to_string_lossy().replace('\\', "/"))
+}
+
+fn should_walk_entry(repo_root: &Path, entry_path: &Path, excludes: &[String]) -> bool {
+    let Some(rel_path) = relative_path_string(repo_root, entry_path) else {
+        return true;
+    };
+    if rel_path.is_empty() {
+        return true;
+    }
+    !is_excluded_path(&rel_path, excludes)
+}
+
+fn should_reuse_previous_file_state(
+    previous: &FileState,
+    len: u64,
+    modified: Option<SystemTime>,
+    force_content_refresh: bool,
+) -> bool {
+    !force_content_refresh && previous.len == len && previous.modified == modified
+}
+
+fn is_excluded_path(path: &str, excludes: &[String]) -> bool {
+    excludes.iter().any(|pattern| {
+        let normalized = pattern.trim_start_matches("./").trim_end_matches('/');
+        path == normalized || path.starts_with(&format!("{normalized}/"))
+    })
+}
+
+fn build_unified_diff(before: Option<&str>, after: Option<&str>, path: &str) -> Option<String> {
+    let old = before.unwrap_or_default();
+    let new = after.unwrap_or_default();
+    if old == new {
+        return None;
+    }
+    let diff = TextDiff::from_lines(old, new)
+        .unified_diff()
+        .header(&format!("a/{path}"), &format!("b/{path}"))
+        .to_string();
+    if diff.trim().is_empty() {
+        None
+    } else {
+        Some(diff)
+    }
+}
+
+fn guess_language(path: &str) -> String {
+    Path::new(path)
+        .extension()
+        .and_then(OsStr::to_str)
+        .map(|ext| ext.to_lowercase())
+        .unwrap_or_else(|| "unknown".to_string())
+}
+
+fn generate_session_id() -> String {
+    format!(
+        "{}-{}-{}",
+        Utc::now().format("%Y%m%dT%H%M%SZ"),
+        std::process::id(),
+        EVENT_COUNTER.fetch_add(1, Ordering::Relaxed)
+    )
+}
+
+fn generate_event_id() -> String {
+    format!(
+        "evt-{}-{}",
+        Utc::now().format("%Y%m%dT%H%M%S%.3fZ"),
+        EVENT_COUNTER.fetch_add(1, Ordering::Relaxed)
+    )
+}
+
+fn write_transcript_event(path: &Path, event: &TranscriptEvent) -> Result<()> {
+    append_jsonl(path, event)
+}
+
+fn file_inode(metadata: &fs::Metadata) -> Option<u64> {
+    #[cfg(unix)]
+    {
+        Some(metadata.ino())
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = metadata;
+        None
+    }
 }
 
 fn cmd_pause(repo_root: &Path, args: PauseArgs) -> Result<()> {
@@ -497,9 +1638,15 @@ fn cmd_reset(repo_root: &Path) -> Result<()> {
     let state = State::default();
     save_state(repo_root, &state)?;
 
-    let weekly_dir = repo_root.join(WEEKLY_DIR);
-    if weekly_dir.exists() {
-        for entry in fs::read_dir(&weekly_dir)? {
+    for dir in [
+        repo_root.join(WEEKLY_DIR),
+        repo_root.join(TRANSCRIPT_DIR),
+        repo_root.join(RUNTIME_DIR),
+    ] {
+        if !dir.exists() {
+            continue;
+        }
+        for entry in fs::read_dir(&dir)? {
             let entry = entry?;
             if entry.file_type()?.is_file() {
                 fs::remove_file(entry.path())?;
@@ -622,6 +1769,8 @@ fn cmd_attrib_fix(repo_root: &Path, args: AttribFixArgs) -> Result<()> {
 fn ensure_runtime_dirs(repo_root: &Path) -> Result<()> {
     fs::create_dir_all(repo_root.join(SESSION_DIR))?;
     fs::create_dir_all(repo_root.join(WEEKLY_DIR))?;
+    fs::create_dir_all(repo_root.join(TRANSCRIPT_DIR))?;
+    fs::create_dir_all(repo_root.join(RUNTIME_DIR))?;
     Ok(())
 }
 
@@ -985,7 +2134,7 @@ struct SizedFile {
 
 fn collect_log_files(repo_root: &Path) -> Result<Vec<SizedFile>> {
     let mut files = Vec::new();
-    for rel in [SESSION_DIR, WEEKLY_DIR] {
+    for rel in [SESSION_DIR, WEEKLY_DIR, TRANSCRIPT_DIR] {
         let dir = repo_root.join(rel);
         if !dir.exists() {
             continue;
@@ -1017,4 +2166,183 @@ fn touch(path: &Path) -> Result<()> {
     }
     let _ = File::options().create(true).append(true).open(path)?;
     Ok(())
+}
+
+fn append_start_failed_session_end(
+    transcript_path: &Path,
+    log_schema_version: &str,
+    session_id: &str,
+    mode: Mode,
+    error_message: &str,
+) -> Result<()> {
+    let end_event = TranscriptEvent {
+        log_schema_version: log_schema_version.to_string(),
+        event_id: generate_event_id(),
+        session_id: session_id.to_string(),
+        event_type: "session_end".to_string(),
+        timestamp: Utc::now(),
+        mode,
+        payload: Some(json!({
+            "stats": {
+                "chat_events": 0,
+                "diff_events": 0,
+                "duration_sec": 0,
+                "history_offset": 0
+            },
+            "reason": "start_failed",
+            "errors": [error_message]
+        })),
+        notes: None,
+    };
+    write_transcript_event(transcript_path, &end_event)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static TEMP_DIR_COUNTER: AtomicU64 = AtomicU64::new(1);
+
+    struct TempDirGuard {
+        path: PathBuf,
+    }
+
+    impl TempDirGuard {
+        fn new(prefix: &str) -> Result<Self> {
+            let id = TEMP_DIR_COUNTER.fetch_add(1, Ordering::Relaxed);
+            let path = std::env::temp_dir().join(format!("{prefix}-{}-{id}", std::process::id()));
+            fs::create_dir_all(&path)?;
+            Ok(Self { path })
+        }
+
+        fn path(&self) -> &Path {
+            &self.path
+        }
+    }
+
+    impl Drop for TempDirGuard {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.path);
+        }
+    }
+
+    #[test]
+    fn should_walk_entry_skips_excluded_dirs_and_keeps_similar_prefixes() {
+        let repo_root = PathBuf::from("/tmp/repo");
+        let excludes = vec![".codex-spp/".to_string(), ".git/".to_string()];
+
+        assert!(!should_walk_entry(
+            &repo_root,
+            &repo_root.join(".codex-spp"),
+            &excludes
+        ));
+        assert!(!should_walk_entry(
+            &repo_root,
+            &repo_root.join(".codex-spp/runtime"),
+            &excludes
+        ));
+        assert!(should_walk_entry(
+            &repo_root,
+            &repo_root.join(".codex-spp-backup"),
+            &excludes
+        ));
+    }
+
+    #[test]
+    fn recorder_loop_stops_before_history_read_when_stop_requested() -> Result<()> {
+        let temp = TempDirGuard::new("spp-recorder-stop")?;
+        let control_path = temp.path().join("control");
+        fs::write(&control_path, "stop\n")?;
+
+        let args = DriveRecordArgs {
+            session_id: "session".to_string(),
+            log_schema_version: "1.1".to_string(),
+            transcript_path: temp.path().join("transcript.jsonl"),
+            history_path: temp.path().join("missing-history.jsonl"),
+            history_offset: 0,
+            control_path,
+            done_path: temp.path().join("done.json"),
+            include_file_diff: true,
+            capture_full_text: true,
+            max_event_bytes: DEFAULT_TRANSCRIPT_EVENT_MAX_BYTES,
+            poll_interval_ms: 100,
+            exclude: Vec::new(),
+        };
+
+        let done = run_drive_recorder_loop(temp.path(), &args)?;
+        assert_eq!(done.chat_events, 0);
+        assert_eq!(done.diff_events, 0);
+        assert!(done.errors.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn should_reuse_previous_file_state_respects_force_refresh() {
+        let previous = FileState {
+            len: 10,
+            modified: Some(SystemTime::UNIX_EPOCH),
+            content: Arc::<str>::from("previous"),
+        };
+
+        assert!(should_reuse_previous_file_state(
+            &previous,
+            10,
+            Some(SystemTime::UNIX_EPOCH),
+            false
+        ));
+        assert!(!should_reuse_previous_file_state(
+            &previous,
+            10,
+            Some(SystemTime::UNIX_EPOCH),
+            true
+        ));
+    }
+
+    #[test]
+    fn append_start_failed_session_end_writes_recovery_event() -> Result<()> {
+        let temp = TempDirGuard::new("spp-start-failed")?;
+        let transcript_path = temp.path().join("transcript.jsonl");
+        let start_event = TranscriptEvent {
+            log_schema_version: "1.1".to_string(),
+            event_id: "e1".to_string(),
+            session_id: "session-a".to_string(),
+            event_type: "session_start".to_string(),
+            timestamp: Utc::now(),
+            mode: Mode::Drive,
+            payload: None,
+            notes: None,
+        };
+        write_transcript_event(&transcript_path, &start_event)?;
+
+        append_start_failed_session_end(
+            &transcript_path,
+            "1.1",
+            "session-a",
+            Mode::Drive,
+            "spawn failed",
+        )?;
+
+        let raw = fs::read_to_string(&transcript_path)?;
+        let events = raw
+            .lines()
+            .map(serde_json::from_str::<Value>)
+            .collect::<Result<Vec<_>, _>>()?;
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[1]["event_type"], "session_end");
+        assert_eq!(events[1]["payload"]["reason"], "start_failed");
+        assert_eq!(events[1]["payload"]["errors"][0], "spawn failed");
+        Ok(())
+    }
+
+    #[test]
+    fn should_force_refresh_file_state_uses_fixed_interval() {
+        assert!(!should_force_refresh_file_state(1));
+        assert!(!should_force_refresh_file_state(
+            FILE_STATE_REVALIDATE_INTERVAL_POLLS - 1
+        ));
+        assert!(should_force_refresh_file_state(
+            FILE_STATE_REVALIDATE_INTERVAL_POLLS
+        ));
+    }
 }

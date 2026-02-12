@@ -40,4 +40,4 @@
 
 - 詳細ポリシーは `.agents/` を正本として管理する。
 - ただし本ファイル（`AGENTS.md`）には、Codex が確実に解釈できるよう重要制約を重複記載する。
-- Skills は `skills/*/SKILL.md` に定義し、Drive/Coach/Stats の運用を補強する。
+- Skills は `.agents/skills/*/SKILL.md` を正本とし、`skills/*/SKILL.md` は互換ミラーとして運用する。
