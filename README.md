@@ -66,7 +66,7 @@ cargo run -p spp -- codex --dry-run
 
 ```text
 spp init
-spp status
+spp status [--plain]
 spp drive              # alias of `spp drive start`
 spp drive start
 spp drive stop
@@ -85,6 +85,9 @@ spp attrib fix --actor <human|ai> <commit>
   Creates runtime directories and default state/config when missing.
 - `status`
   Computes weekly metrics, evaluates gate, writes weekly report, updates mode if needed.
+  Default output is a two-block rich summary (`mode/gate/week`, `gate reason`,
+  lines+commits ratios, human/AI breakdown, pause status, notes).
+  Use `--plain` for legacy minimal output.
 - `drive start`
   Starts a Drive session boundary, writes `session_start`, and launches transcript recorder.
 - `drive stop`
