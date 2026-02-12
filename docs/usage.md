@@ -21,6 +21,8 @@
 - Chat source defaults to `CODEX_HOME/history.jsonl` (or `~/.codex/history.jsonl`).
 - Drive transcript files are written to `.codex-spp/transcripts/<session-id>.jsonl`.
 - Event types: `session_start`, `chat_user`, `chat_assistant`, `file_diff`, `session_end`.
+- `file_diff` events are emitted only when `diff_snapshot_enabled = true` and
+  `[transcript].include_file_diff = true`.
 - Runtime recorder control files are written to `.codex-spp/runtime/`.
 - Default poll interval is `2000ms`; increase `[transcript].poll_interval_ms` for larger repositories.
 
