@@ -14,6 +14,8 @@ It keeps development human-led by combining policy files, Codex skills, and a wr
 - `Normal` / `Drive` mode operations aligned with SPP policy.
 - Weekly gate evaluation with `human:ai ratio` metrics.
 - Automatic shift to Drive mode when weekly ratio falls below target.
+- Drive session transcripts with boundary events (`session_start` / `session_end`).
+- Chat ingestion from Codex history (`history.jsonl`) plus saved-file diff capture.
 - Safe Codex launch wrapper (`spp codex`) with enforced sandbox and approval flags.
 - Attribution system for commits (manual override, trailer, author/email, git notes).
 - Persistent logs under `./.codex-spp/` with JSON schema definitions.
@@ -23,9 +25,9 @@ It keeps development human-led by combining policy files, Codex skills, and a wr
 - `AGENTS.md`
   SPP hard constraints that Codex should always follow.
 - `.agents/`
-  Source-of-truth policy, mode rules, attribution rules, and JSON schemas.
+  Source-of-truth policy, mode rules, attribution rules, schemas, and primary skills.
 - `skills/`
-  Codex skills for drive coaching, retrospective coaching, and weekly stats guidance.
+  Compatibility mirror for Codex skill discovery.
 - `crates/spp/`
   Rust implementation of the `spp` wrapper CLI.
 - `.codex-spp/` (runtime, git-ignored)
@@ -64,7 +66,10 @@ cargo run -p spp -- codex --dry-run
 ```text
 spp init
 spp status
-spp drive
+spp drive              # alias of `spp drive start`
+spp drive start
+spp drive stop
+spp drive status
 spp pause --hours <1..24>
 spp resume
 spp reset
@@ -79,8 +84,12 @@ spp attrib fix --actor <human|ai> <commit>
   Creates runtime directories and default state/config when missing.
 - `status`
   Computes weekly metrics, evaluates gate, writes weekly report, updates mode if needed.
-- `drive`
-  Manually switches current mode to Drive.
+- `drive start`
+  Starts a Drive session boundary, writes `session_start`, and launches transcript recorder.
+- `drive stop`
+  Stops the active Drive recorder, writes `session_end`, and closes the session.
+- `drive status`
+  Shows mode and active Drive session metadata.
 - `pause`
   Temporarily bypasses gate enforcement for up to 24 hours.
 - `resume`
@@ -90,7 +99,7 @@ spp attrib fix --actor <human|ai> <commit>
 - `codex`
   Applies gate logic, logs session metadata, and launches Codex with enforced flags.
 - `project init`
-  Scaffolds SPP assets into a target project directory (`AGENTS.md`, `.agents`, `skills`,
+  Scaffolds SPP assets into a target project directory (`AGENTS.md`, `.agents`, `.agents/skills`, `skills`,
   `.codex-spp/config.toml`, and `.gitignore` rule for `/.codex-spp/`).
 - `attrib fix`
   Saves manual attribution override for a commit hash.
@@ -150,6 +159,7 @@ Main settings:
 - `max_log_bytes`
 - `diff_snapshot_enabled`
 - `[codex.normal]` / `[codex.drive]`
+- `[transcript]` (chat source, history path, capture options, watcher excludes)
 - `[attribution].codex_author_emails`
 
 ## Logs and Data Layout
@@ -158,12 +168,17 @@ Main settings:
   Current mode, pause state, attribution overrides, updated timestamp.
 - `.codex-spp/sessions/<year>-W<week>.jsonl`
   Session-level Codex launch logs.
+- `.codex-spp/transcripts/<session-id>.jsonl`
+  Drive session transcript events (`session_*`, `chat_*`, `file_diff`).
+- `.codex-spp/runtime/<session-id>.control|.done`
+  Recorder control/summary files for active session lifecycle.
 - `.codex-spp/weekly/<year>-W<week>.json`
   Weekly metric report and gate result.
 
 Schemas:
 
 - `.agents/schemas/template_spp.session.schema.json`
+- `.agents/schemas/template_spp.transcript_event.schema.json`
 - `.agents/schemas/template_spp.weekly_report.schema.json`
 
 Log retention is controlled by `max_log_bytes`; oldest log files are pruned when exceeding the limit.

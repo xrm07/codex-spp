@@ -18,6 +18,7 @@
 ## Logging
 
 - `sessions/*.jsonl`: セッション要約ログ
+- `transcripts/<session-id>.jsonl`: Drive セッション境界つきイベントログ（chat/diff）
 - `weekly/*.json`: 週次集計レポート
 - `state.json`: モード・pause 状態・補正情報
 
