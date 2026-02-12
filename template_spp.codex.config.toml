@@ -1,0 +1,5 @@
+# codex project config template
+# Copy to .codex/config.toml when applying to a repository.
+
+approval_policy = "on-request"
+sandbox_mode = "workspace-write"

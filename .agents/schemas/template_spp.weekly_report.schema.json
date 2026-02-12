@@ -1,0 +1,76 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://codex-spp.local/schemas/template_spp.weekly_report.schema.json",
+  "title": "codex-spp weekly report template",
+  "type": "object",
+  "required": [
+    "log_schema_version",
+    "generated_at",
+    "iso_week",
+    "year",
+    "human_lines_added",
+    "ai_lines_added",
+    "human_commit_count",
+    "ai_commit_count",
+    "ratio",
+    "target_ratio",
+    "gate_passed",
+    "mode_after_evaluation"
+  ],
+  "properties": {
+    "log_schema_version": {
+      "type": "string"
+    },
+    "generated_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "year": {
+      "type": "integer",
+      "minimum": 1970
+    },
+    "iso_week": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 53
+    },
+    "human_lines_added": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "ai_lines_added": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "human_commit_count": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "ai_commit_count": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "ratio": {
+      "type": "number",
+      "minimum": 0.0,
+      "maximum": 1.0
+    },
+    "target_ratio": {
+      "type": "number",
+      "minimum": 0.0,
+      "maximum": 1.0
+    },
+    "gate_passed": {
+      "type": "boolean"
+    },
+    "mode_after_evaluation": {
+      "type": "string",
+      "enum": ["normal", "drive"]
+    },
+    "notes": {
+      "type": "array",
+      "items": { "type": "string" }
+    }
+  },
+  "additionalProperties": false
+}
