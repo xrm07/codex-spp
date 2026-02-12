@@ -9,7 +9,7 @@
 - `spp resume`: clear pause and resume gate checks.
 - `spp reset`: reset weekly state and manual attribution overrides.
 - `spp codex`: launch Codex with enforced sandbox/approval flags.
-- `spp project init <project>`: scaffold SPP assets into another project.
+- `spp project init [PROJECT]`: scaffold SPP assets into another project.
 
 ## Attribution
 
