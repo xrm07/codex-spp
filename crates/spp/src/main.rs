@@ -16,6 +16,52 @@ const STATE_FILE: &str = ".codex-spp/state.json";
 const SESSION_DIR: &str = ".codex-spp/sessions";
 const WEEKLY_DIR: &str = ".codex-spp/weekly";
 const TEMPLATE_CONFIG: &str = "template_spp.config.toml";
+const PROJECT_RUNTIME_CONFIG_FILE: &str = ".codex-spp/config.toml";
+const PROJECT_CODEX_CONFIG_FILE: &str = ".codex/config.toml";
+const GITIGNORE_RULE_CODEX_SPP: &str = "/.codex-spp/";
+
+const PROJECT_ASSETS: &[(&str, &str)] = &[
+    ("AGENTS.md", include_str!("../../../AGENTS.md")),
+    (
+        ".agents/policy.md",
+        include_str!("../../../.agents/policy.md"),
+    ),
+    (
+        ".agents/attribution.md",
+        include_str!("../../../.agents/attribution.md"),
+    ),
+    (
+        ".agents/modes/drive.md",
+        include_str!("../../../.agents/modes/drive.md"),
+    ),
+    (
+        ".agents/modes/normal.md",
+        include_str!("../../../.agents/modes/normal.md"),
+    ),
+    (
+        ".agents/schemas/template_spp.session.schema.json",
+        include_str!("../../../.agents/schemas/template_spp.session.schema.json"),
+    ),
+    (
+        ".agents/schemas/template_spp.weekly_report.schema.json",
+        include_str!("../../../.agents/schemas/template_spp.weekly_report.schema.json"),
+    ),
+    (
+        "skills/spp-drive/SKILL.md",
+        include_str!("../../../skills/spp-drive/SKILL.md"),
+    ),
+    (
+        "skills/spp-coach/SKILL.md",
+        include_str!("../../../skills/spp-coach/SKILL.md"),
+    ),
+    (
+        "skills/spp-stats/SKILL.md",
+        include_str!("../../../skills/spp-stats/SKILL.md"),
+    ),
+];
+
+const PROJECT_RUNTIME_CONFIG_ASSET: &str = include_str!("../../../template_spp.config.toml");
+const PROJECT_CODEX_CONFIG_ASSET: &str = include_str!("../../../template_spp.codex.config.toml");
 
 #[derive(Parser, Debug)]
 #[command(name = "spp", version, about = "codex-spp wrapper CLI")]
@@ -33,6 +79,10 @@ enum Commands {
     Resume,
     Reset,
     Codex(CodexArgs),
+    Project {
+        #[command(subcommand)]
+        command: ProjectCommands,
+    },
     Attrib {
         #[command(subcommand)]
         command: AttribCommands,
@@ -51,6 +101,21 @@ struct CodexArgs {
     dry_run: bool,
     #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
     extra: Vec<String>,
+}
+
+#[derive(Subcommand, Debug)]
+enum ProjectCommands {
+    Init(ProjectInitArgs),
+}
+
+#[derive(Args, Debug)]
+struct ProjectInitArgs {
+    #[arg(value_name = "PROJECT", default_value = ".")]
+    project: PathBuf,
+    #[arg(long, default_value_t = false)]
+    force: bool,
+    #[arg(long, default_value_t = false)]
+    with_codex_config: bool,
 }
 
 #[derive(Subcommand, Debug)]
@@ -233,22 +298,105 @@ struct WeeklyMetrics {
     notes: Vec<String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WriteOutcome {
+    Created,
+    Overwritten,
+    Skipped,
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
-    let repo_root = detect_repo_root()?;
 
     match cli.command {
-        Commands::Init => cmd_init(&repo_root),
-        Commands::Status => cmd_status(&repo_root),
-        Commands::Drive => cmd_drive(&repo_root),
-        Commands::Pause(args) => cmd_pause(&repo_root, args),
-        Commands::Resume => cmd_resume(&repo_root),
-        Commands::Reset => cmd_reset(&repo_root),
-        Commands::Codex(args) => cmd_codex(&repo_root, args),
-        Commands::Attrib { command } => match command {
-            AttribCommands::Fix(args) => cmd_attrib_fix(&repo_root, args),
+        Commands::Project { command } => match command {
+            ProjectCommands::Init(args) => cmd_project_init(args),
         },
+        other => {
+            let repo_root = detect_repo_root()?;
+            match other {
+                Commands::Init => cmd_init(&repo_root),
+                Commands::Status => cmd_status(&repo_root),
+                Commands::Drive => cmd_drive(&repo_root),
+                Commands::Pause(args) => cmd_pause(&repo_root, args),
+                Commands::Resume => cmd_resume(&repo_root),
+                Commands::Reset => cmd_reset(&repo_root),
+                Commands::Codex(args) => cmd_codex(&repo_root, args),
+                Commands::Attrib { command } => match command {
+                    AttribCommands::Fix(args) => cmd_attrib_fix(&repo_root, args),
+                },
+                Commands::Project { .. } => unreachable!("project command handled above"),
+            }
+        }
     }
+}
+
+fn cmd_project_init(args: ProjectInitArgs) -> Result<()> {
+    let project_root = if args.project.is_absolute() {
+        args.project
+    } else {
+        std::env::current_dir()
+            .with_context(|| "failed to resolve current directory")?
+            .join(args.project)
+    };
+    fs::create_dir_all(&project_root)
+        .with_context(|| format!("failed to create project dir {}", project_root.display()))?;
+
+    let mut created = 0_u64;
+    let mut overwritten = 0_u64;
+    let mut skipped = 0_u64;
+
+    for (rel, content) in PROJECT_ASSETS {
+        let outcome = write_text_asset(&project_root.join(rel), content, args.force)?;
+        match outcome {
+            WriteOutcome::Created => created += 1,
+            WriteOutcome::Overwritten => overwritten += 1,
+            WriteOutcome::Skipped => skipped += 1,
+        }
+    }
+
+    let runtime_cfg_outcome = write_text_asset(
+        &project_root.join(PROJECT_RUNTIME_CONFIG_FILE),
+        PROJECT_RUNTIME_CONFIG_ASSET,
+        args.force,
+    )?;
+    match runtime_cfg_outcome {
+        WriteOutcome::Created => created += 1,
+        WriteOutcome::Overwritten => overwritten += 1,
+        WriteOutcome::Skipped => skipped += 1,
+    }
+
+    if args.with_codex_config {
+        let codex_cfg_outcome = write_text_asset(
+            &project_root.join(PROJECT_CODEX_CONFIG_FILE),
+            PROJECT_CODEX_CONFIG_ASSET,
+            args.force,
+        )?;
+        match codex_cfg_outcome {
+            WriteOutcome::Created => created += 1,
+            WriteOutcome::Overwritten => overwritten += 1,
+            WriteOutcome::Skipped => skipped += 1,
+        }
+    }
+
+    let gitignore_path = project_root.join(".gitignore");
+    let gitignore_updated = ensure_gitignore_rule(&gitignore_path, GITIGNORE_RULE_CODEX_SPP)?;
+
+    println!("project scaffold complete: {}", project_root.display());
+    println!(
+        "assets -> created: {}, overwritten: {}, skipped: {}",
+        created, overwritten, skipped
+    );
+    if gitignore_updated {
+        println!("updated: {}", gitignore_path.display());
+    } else {
+        println!("gitignore already contains {}", GITIGNORE_RULE_CODEX_SPP);
+    }
+    if skipped > 0 && !args.force {
+        println!("note: existing files were skipped (use --force to overwrite)");
+    }
+
+    Ok(())
 }
 
 fn cmd_init(repo_root: &Path) -> Result<()> {
@@ -761,6 +909,52 @@ fn append_jsonl<T: Serialize>(path: &Path, value: &T) -> Result<()> {
         .with_context(|| format!("failed to open {}", path.display()))?;
     writeln!(file, "{line}")?;
     Ok(())
+}
+
+fn write_text_asset(path: &Path, content: &str, force: bool) -> Result<WriteOutcome> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+
+    if path.exists() && !force {
+        return Ok(WriteOutcome::Skipped);
+    }
+
+    let outcome = if path.exists() {
+        WriteOutcome::Overwritten
+    } else {
+        WriteOutcome::Created
+    };
+    fs::write(path, content).with_context(|| format!("failed to write {}", path.display()))?;
+    Ok(outcome)
+}
+
+fn ensure_gitignore_rule(path: &Path, rule: &str) -> Result<bool> {
+    let mut content = if path.exists() {
+        fs::read_to_string(path).with_context(|| format!("failed to read {}", path.display()))?
+    } else {
+        String::new()
+    };
+
+    let has_rule = content.lines().any(|line| {
+        let normalized = line.trim();
+        normalized == rule || normalized == ".codex-spp/" || normalized == "/.codex-spp"
+    });
+    if has_rule {
+        return Ok(false);
+    }
+
+    if !content.is_empty() && !content.ends_with('\n') {
+        content.push('\n');
+    }
+    content.push_str(rule);
+    content.push('\n');
+
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(path, content).with_context(|| format!("failed to write {}", path.display()))?;
+    Ok(true)
 }
 
 fn enforce_log_size(repo_root: &Path, max_bytes: u64) -> Result<()> {

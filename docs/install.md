@@ -10,6 +10,7 @@
 
 1. Build CLI:
    - `cargo build -p spp`
+   - (global install option) `cargo install --path crates/spp`
 2. Prepare runtime config:
    - `cp template_spp.config.toml .codex-spp/config.toml`
 3. (Optional) Prepare Codex project config template:
@@ -21,3 +22,7 @@
 
 - `cargo run -p spp -- status`
 - `cargo run -p spp -- codex --dry-run`
+
+## Bootstrap another repository
+
+- `spp project init /path/to/target-project --with-codex-config`
