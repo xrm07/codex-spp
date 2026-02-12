@@ -95,6 +95,7 @@ enum Actor {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 struct AppConfig {
     log_schema_version: String,
     weekly_ratio_target: f64,
@@ -105,12 +106,16 @@ struct AppConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 struct CodexConfig {
+    #[serde(default = "default_codex_mode_normal")]
     normal: CodexModeConfig,
+    #[serde(default = "default_codex_mode_drive")]
     drive: CodexModeConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 struct CodexModeConfig {
     sandbox: String,
     approval: String,
@@ -128,18 +133,41 @@ impl Default for AppConfig {
             weekly_ratio_target: 0.70,
             max_log_bytes: 524_288_000,
             diff_snapshot_enabled: false,
-            codex: CodexConfig {
-                normal: CodexModeConfig {
-                    sandbox: "workspace-write".to_string(),
-                    approval: "on-request".to_string(),
-                },
-                drive: CodexModeConfig {
-                    sandbox: "read-only".to_string(),
-                    approval: "on-request".to_string(),
-                },
-            },
+            codex: CodexConfig::default(),
             attribution: AttributionConfig::default(),
         }
+    }
+}
+
+impl Default for CodexConfig {
+    fn default() -> Self {
+        Self {
+            normal: default_codex_mode_normal(),
+            drive: default_codex_mode_drive(),
+        }
+    }
+}
+
+impl Default for CodexModeConfig {
+    fn default() -> Self {
+        Self {
+            sandbox: "read-only".to_string(),
+            approval: "on-request".to_string(),
+        }
+    }
+}
+
+fn default_codex_mode_normal() -> CodexModeConfig {
+    CodexModeConfig {
+        sandbox: "workspace-write".to_string(),
+        approval: "on-request".to_string(),
+    }
+}
+
+fn default_codex_mode_drive() -> CodexModeConfig {
+    CodexModeConfig {
+        sandbox: "read-only".to_string(),
+        approval: "on-request".to_string(),
     }
 }
 
@@ -350,13 +378,15 @@ fn cmd_codex(repo_root: &Path, args: CodexArgs) -> Result<()> {
         Mode::Drive => &config.codex.drive,
     };
 
-    let mut codex_args = vec![
+    validate_codex_extra_args(&args.extra)?;
+
+    let mut codex_args = args.extra.clone();
+    codex_args.extend([
         "--sandbox".to_string(),
         codex_mode.sandbox.clone(),
         "--ask-for-approval".to_string(),
         codex_mode.approval.clone(),
-    ];
-    codex_args.extend(args.extra.clone());
+    ]);
 
     let branch = git_output(repo_root, &["rev-parse", "--abbrev-ref", "HEAD"])
         .unwrap_or_else(|_| "unknown".to_string())
@@ -401,6 +431,21 @@ fn cmd_codex(repo_root: &Path, args: CodexArgs) -> Result<()> {
         bail!("codex exited with status {}", status);
     }
 
+    Ok(())
+}
+
+fn validate_codex_extra_args(extra: &[String]) -> Result<()> {
+    for arg in extra {
+        if arg == "--full-auto" || arg.starts_with("--full-auto=") {
+            bail!("`--full-auto` is prohibited by SPP policy");
+        }
+        if arg == "--sandbox" || arg.starts_with("--sandbox=") {
+            bail!("`--sandbox` is managed by spp and cannot be overridden");
+        }
+        if arg == "--ask-for-approval" || arg.starts_with("--ask-for-approval=") {
+            bail!("`--ask-for-approval` is managed by spp and cannot be overridden");
+        }
+    }
     Ok(())
 }
 
@@ -587,6 +632,7 @@ fn collect_weekly_metrics(
             &since,
             "--until",
             &until,
+            "--no-merges",
             "--pretty=format:%H",
         ],
     )?;
