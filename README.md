@@ -162,6 +162,8 @@ Main settings:
 - `[transcript]` (chat source, history path, capture options, watcher excludes)
 - `[attribution].codex_author_emails`
 
+Tip: for large repositories, increase `[transcript].poll_interval_ms` to reduce recorder I/O load.
+
 ## Logs and Data Layout
 
 - `.codex-spp/state.json`

@@ -21,7 +21,7 @@ capture_full_text = true
 max_event_bytes = 64000
 include_file_diff = true
 watch_exclude = [".git/", ".codex-spp/", "target/"]
-poll_interval_ms = 1000
+poll_interval_ms = 2000
 
 [attribution]
 codex_author_emails = ["codex-bot@example.com"]

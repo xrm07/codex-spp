@@ -2,12 +2,13 @@ use std::collections::{HashMap, HashSet};
 use std::env;
 use std::ffi::OsStr;
 use std::fs::{self, File, OpenOptions};
-use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
+use std::io::{BufRead, BufReader, ErrorKind, Read, Seek, SeekFrom, Write};
 #[cfg(unix)]
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::thread::sleep;
 use std::time::{Duration as StdDuration, Instant, SystemTime};
 
@@ -32,7 +33,7 @@ const GITIGNORE_RULE_CODEX_SPP: &str = "/.codex-spp/";
 const DEFAULT_HISTORY_PATH: &str = "auto";
 const DEFAULT_CHAT_SOURCE: &str = "history_jsonl";
 const DEFAULT_TRANSCRIPT_EVENT_MAX_BYTES: u64 = 64_000;
-const DEFAULT_POLL_INTERVAL_MS: u64 = 1000;
+const DEFAULT_POLL_INTERVAL_MS: u64 = 2000;
 
 static EVENT_COUNTER: AtomicU64 = AtomicU64::new(1);
 
@@ -411,6 +412,13 @@ struct ChatMessage {
     raw: Option<Value>,
 }
 
+#[derive(Debug, Clone)]
+struct FileState {
+    len: u64,
+    modified: Option<SystemTime>,
+    content: Arc<str>,
+}
+
 impl Default for RecorderDone {
     fn default() -> Self {
         Self {
@@ -782,14 +790,39 @@ fn cmd_drive_stop(repo_root: &Path) -> Result<()> {
 
     let done = wait_for_recorder_done(&done_path, StdDuration::from_secs(15))?;
     let timeout = done.is_none();
-    let done = done.unwrap_or_else(|| RecorderDone {
-        session_id: active.session_id.clone(),
-        finished_at: Utc::now(),
-        history_offset: active.history_offset,
-        chat_events: 0,
-        diff_events: 0,
-        errors: vec!["recorder did not finish in time".to_string()],
-    });
+    let mut timeout_errors = Vec::new();
+    if timeout {
+        if let Some(pid) = active.recorder_pid {
+            if let Err(err) = terminate_recorder_process(pid) {
+                timeout_errors.push(format!(
+                    "recorder did not finish in time; failed to terminate pid {}: {}",
+                    pid, err
+                ));
+            } else {
+                timeout_errors.push(format!(
+                    "recorder did not finish in time; sent termination signal to pid {}",
+                    pid
+                ));
+            }
+        } else {
+            timeout_errors.push("recorder did not finish in time (pid unavailable)".to_string());
+        }
+    }
+    let done = match done {
+        Some(done) => done,
+        None => RecorderDone {
+            session_id: active.session_id.clone(),
+            finished_at: Utc::now(),
+            history_offset: active.history_offset,
+            chat_events: 0,
+            diff_events: 0,
+            errors: if timeout_errors.is_empty() {
+                vec!["recorder did not finish in time".to_string()]
+            } else {
+                timeout_errors
+            },
+        },
+    };
 
     let end_event = TranscriptEvent {
         log_schema_version: config.log_schema_version.clone(),
@@ -819,8 +852,10 @@ fn cmd_drive_stop(repo_root: &Path) -> Result<()> {
     state.active_drive_session = None;
     save_state(repo_root, &state)?;
 
-    let _ = fs::remove_file(control_path);
-    let _ = fs::remove_file(done_path);
+    if !timeout {
+        let _ = fs::remove_file(control_path);
+        let _ = fs::remove_file(done_path);
+    }
 
     println!("drive session stopped: {}", active.session_id);
     println!(
@@ -997,6 +1032,39 @@ fn wait_for_recorder_done(path: &Path, timeout: StdDuration) -> Result<Option<Re
     Ok(None)
 }
 
+fn terminate_recorder_process(pid: u32) -> Result<()> {
+    #[cfg(unix)]
+    {
+        let status = Command::new("kill")
+            .arg("-TERM")
+            .arg(pid.to_string())
+            .status()
+            .with_context(|| "failed to execute kill command")?;
+        if !status.success() {
+            bail!("kill -TERM {} exited with status {}", pid, status);
+        }
+        return Ok(());
+    }
+
+    #[cfg(windows)]
+    {
+        let status = Command::new("taskkill")
+            .args(["/PID", &pid.to_string(), "/T", "/F"])
+            .status()
+            .with_context(|| "failed to execute taskkill command")?;
+        if !status.success() {
+            bail!("taskkill {} exited with status {}", pid, status);
+        }
+        return Ok(());
+    }
+
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = pid;
+        bail!("recorder termination is not supported on this platform");
+    }
+}
+
 fn write_recorder_done(path: &Path, done: &RecorderDone) -> Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
@@ -1008,7 +1076,7 @@ fn write_recorder_done(path: &Path, done: &RecorderDone) -> Result<()> {
 fn run_drive_recorder_loop(repo_root: &Path, args: &DriveRecordArgs) -> Result<RecorderDone> {
     let mut history_offset = args.history_offset;
     let mut snapshot = if args.include_file_diff {
-        capture_workspace_text_files(repo_root, &args.exclude)?
+        capture_workspace_text_files(repo_root, &args.exclude, None)?
     } else {
         HashMap::new()
     };
@@ -1067,7 +1135,7 @@ fn run_drive_recorder_loop(repo_root: &Path, args: &DriveRecordArgs) -> Result<R
         }
 
         if args.include_file_diff {
-            match capture_workspace_text_files(repo_root, &args.exclude) {
+            match capture_workspace_text_files(repo_root, &args.exclude, Some(&snapshot)) {
                 Ok(next_snapshot) => {
                     let mut paths: HashSet<String> = HashSet::new();
                     paths.extend(snapshot.keys().cloned());
@@ -1075,8 +1143,8 @@ fn run_drive_recorder_loop(repo_root: &Path, args: &DriveRecordArgs) -> Result<R
                     let mut paths = paths.into_iter().collect::<Vec<_>>();
                     paths.sort();
                     for path in paths {
-                        let before = snapshot.get(&path).map(String::as_str);
-                        let after = next_snapshot.get(&path).map(String::as_str);
+                        let before = snapshot.get(&path).map(|state| state.content.as_ref());
+                        let after = next_snapshot.get(&path).map(|state| state.content.as_ref());
                         if before == after {
                             continue;
                         }
@@ -1131,7 +1199,8 @@ fn run_drive_recorder_loop(repo_root: &Path, args: &DriveRecordArgs) -> Result<R
 fn should_stop_recorder(control_path: &Path) -> bool {
     match fs::read_to_string(control_path) {
         Ok(value) => value.trim() == "stop",
-        Err(_) => false,
+        Err(err) if err.kind() == ErrorKind::NotFound => true,
+        Err(_) => true,
     }
 }
 
@@ -1146,17 +1215,37 @@ fn read_history_values(path: &Path, offset: u64) -> Result<(u64, Vec<Value>)> {
 
     loop {
         let mut line = String::new();
+        let offset_before_read = current_offset;
         let bytes_read = reader.read_line(&mut line)?;
         if bytes_read == 0 {
             break;
         }
-        current_offset += bytes_read as u64;
+
+        if !line.ends_with('\n') {
+            reader
+                .get_mut()
+                .seek(SeekFrom::Start(offset_before_read))
+                .with_context(|| format!("failed to rewind {}", path.display()))?;
+            current_offset = offset_before_read;
+            break;
+        }
+
         let line = line.trim();
+        current_offset += bytes_read as u64;
         if line.is_empty() {
             continue;
         }
-        if let Ok(value) = serde_json::from_str::<Value>(line) {
-            values.push(value);
+
+        match serde_json::from_str::<Value>(line) {
+            Ok(value) => values.push(value),
+            Err(_) => {
+                reader
+                    .get_mut()
+                    .seek(SeekFrom::Start(offset_before_read))
+                    .with_context(|| format!("failed to rewind {}", path.display()))?;
+                current_offset = offset_before_read;
+                break;
+            }
         }
     }
 
@@ -1293,7 +1382,8 @@ fn truncate_to_bytes(input: &str, max_bytes: u64) -> String {
 fn capture_workspace_text_files(
     repo_root: &Path,
     exclude: &[String],
-) -> Result<HashMap<String, String>> {
+    previous: Option<&HashMap<String, FileState>>,
+) -> Result<HashMap<String, FileState>> {
     let mut snapshot = HashMap::new();
     for entry in WalkDir::new(repo_root)
         .follow_links(false)
@@ -1315,9 +1405,19 @@ fn capture_workspace_text_files(
             Ok(metadata) => metadata,
             Err(_) => continue,
         };
-        if metadata.len() > 2_000_000 {
+        let len = metadata.len();
+        if len > 2_000_000 {
             continue;
         }
+        let modified = metadata.modified().ok();
+
+        if let Some(prev) = previous.and_then(|prev| prev.get(&rel_path)) {
+            if prev.len == len && prev.modified == modified {
+                snapshot.insert(rel_path, prev.clone());
+                continue;
+            }
+        }
+
         let mut bytes = Vec::new();
         if File::open(entry.path())
             .and_then(|mut file| file.read_to_end(&mut bytes))
@@ -1332,17 +1432,22 @@ fn capture_workspace_text_files(
             Ok(text) => text,
             Err(_) => continue,
         };
-        snapshot.insert(rel_path, text);
+        snapshot.insert(
+            rel_path,
+            FileState {
+                len,
+                modified,
+                content: Arc::<str>::from(text),
+            },
+        );
     }
     Ok(snapshot)
 }
 
 fn is_excluded_path(path: &str, excludes: &[String]) -> bool {
     excludes.iter().any(|pattern| {
-        let normalized = pattern.trim_start_matches("./");
-        path == normalized
-            || path.starts_with(normalized)
-            || path.starts_with(&format!("{normalized}/"))
+        let normalized = pattern.trim_start_matches("./").trim_end_matches('/');
+        path == normalized || path.starts_with(&format!("{normalized}/"))
     })
 }
 

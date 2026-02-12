@@ -20,6 +20,7 @@
 - Drive transcript files are written to `.codex-spp/transcripts/<session-id>.jsonl`.
 - Event types: `session_start`, `chat_user`, `chat_assistant`, `file_diff`, `session_end`.
 - Runtime recorder control files are written to `.codex-spp/runtime/`.
+- Default poll interval is `2000ms`; increase `[transcript].poll_interval_ms` for larger repositories.
 
 ## Attribution
 
